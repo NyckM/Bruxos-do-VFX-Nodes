@@ -10,8 +10,8 @@ https://github.com/user-attachments/assets/d1e47486-ac3b-4030-be42-56a0f16b0128
 
 ## Instalacao fácil
 
-Usando o Bat dentro da pasta de instalação do ComfyUI, assim ele já baixa os modelos e o custom node automaticamente para você
-versão para Runpod, ainda em desenvolvimento
+Usando o Bat dentro da pasta de instalação do ComfyUI, assim ele já baixa os modelos e o custom node automaticamente para você.
+Versão para Runpod, ainda em desenvolvimento
 
 ### ComfyUI Bruxos do VFX
 
