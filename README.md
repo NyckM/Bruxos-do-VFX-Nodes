@@ -3,6 +3,7 @@
 Custom nodes para usar Bernini/Wan com videos maiores que o limite comum de 81 frames sem criar um sampler Bernini novo.
 
 O node principal troca a logica de um `Bernini Conditioning` unico por condicionamentos em chunks:
+
 <img width="226" height="557" alt="image" src="https://github.com/user-attachments/assets/934fd9b3-087f-47db-aeb2-6ca01967c556" />
 
 ### Bernini Long Condition
