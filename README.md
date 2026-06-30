@@ -1,107 +1,19 @@
+<img width="832" height="480" alt="ChatGPT Image 30 de jun  de 2026, 11_28_48" src="https://github.com/user-attachments/assets/6745a8ce-00ce-4915-a60d-ed1354099311" />
 ﻿# ComfyUI Bruxos do VFX
 
 Custom nodes para usar Bernini/Wan com videos maiores que o limite comum de 81 frames sem criar um sampler Bernini novo.
 
 O node principal troca a logica de um `Bernini Conditioning` unico por condicionamentos em chunks:
 
-```python
-context["video"] = vae.encode(video_chunk)
-
-positive = conditioning_set_values(
-    positive,
-    {"context_latents": [encoded_chunk, optional_tail_memory]}
-)
-```
-
-## Nodes
+<img width="226" height="557" alt="image" src="https://github.com/user-attachments/assets/934fd9b3-087f-47db-aeb2-6ca01967c556" />
 
 ### Bernini Long Condition
-
-Entradas:
-
-- `positive`
-- `negative`
-- `vae`
-- `source_video`
-- `width`
-- `height`
-- `chunk_size`, padrao `81`
-- `overlap`, padrao `5`
-- `batch_size`, padrao `1`
-- `tail_memory`, padrao `True`
-- `tail_frames`, padrao `5`
-
-Saidas:
-
-- `positive_chunks`
-- `negative_chunks`
-- `latent_chunks`
-- `video_chunks`
-- `chunk_ranges`
-- `chunk_count`
 
 Para cada chunk, ele injeta:
 
 - `context_latents: [encoded_chunk]`
 - se `tail_memory=True`, a partir do segundo chunk: `context_latents: [encoded_chunk, tail_latent]`
 - `context: {"video": encoded_chunk}` para compatibilidade com nodes que ainda leem o contexto antigo do Bernini
-
-### Bernini Long Chunk Select
-
-Seleciona um indice de chunk e retorna:
-
-- `positive`
-- `negative`
-- `latent`
-
-Use isso para renderizar cada chunk com o fluxo Bernini atual.
-
-### Bernini Long Video Merge
-
-Recebe uma lista de videos renderizados e faz blend linear no overlap.
-
-### Bernini Long Empty Video Chunks / Append Video Chunk
-
-Utilitarios para montar manualmente a lista de chunks renderizados antes do merge.
-
-### Bernini Long Info
-
-Mostra os ranges de frames de cada chunk.
-
-## Instalacao
-
-Copie a pasta `comfyui-bernini-long-conditioning` para:
-
-```text
-ComfyUI/custom_nodes/
-```
-
-Depois reinicie o ComfyUI.
-
-## Workflow sugerido
-
-1. Substitua `Bernini Conditioning` por `Bernini Long Condition`.
-2. Conecte `positive_chunks`, `negative_chunks` e `latent_chunks` em `Bernini Long Chunk Select`.
-3. Renderize o indice `0`, depois `1`, depois `2`, etc., usando o render/sampler Bernini que voce ja usa.
-4. Junte os videos renderizados com `Bernini Long Empty Video Chunks`, `Bernini Long Append Video Chunk` e `Bernini Long Video Merge`.
-
-## Por que nao ha um Bernini Long Sampler aqui?
-
-Porque, pelo comportamento descrito, o Bernini ja passa contexto pelo conditioning e o patch Wan ja aceita `context_latents` como lista. O ponto robusto e gerar varios conditionings corretos:
-
-```python
-context_latents = [
-    encoded_chunk,
-    tail_latent,
-]
-```
-
-Assim voce aproveita a arquitetura nativa em vez de clonar um sampler inteiro.
-
-Um executor automatico pode ser adicionado depois, mas ele precisa conhecer os nomes e chamadas exatas dos nodes/classes Bernini instalados na sua maquina. Este pacote deixa a parte importante isolada e compativel com o workflow existente.
-
-
----
 
 ## Novidades 0.2.0 / 0.2.1
 
@@ -118,15 +30,6 @@ Kijai no Wan Animate, sem frame congelado), gera, e no final **corta de volta
 ao numero de frames que voce pediu**. Vale pros modos `sequential` e
 `context_window`, e por chunk no sequential (o ultimo chunk costumava cair
 fora do grid). Resultado: `111` entra, `111` sai.
-
-Formula usada:
-
-```python
-aligned = ((target - 1 + 3) // 4) * 4 + 1   # proximo 4n+1
-# ... gera com 'aligned' frames ...
-saida = saida[:target]                       # corta de volta
-```
-
 Nao precisa configurar nada — e automatico. Os logs mostram, por ex.:
 `padding temporal 111->113 (4n+1, espelhado)`.
 
@@ -151,69 +54,10 @@ A mascara pode vir de qualquer lugar (SAM2/SAM3, desenho manual, etc.).
 Para o estilo do `Scail2Color` (mascara colorida por objeto saindo como
 `IMAGE`), use o node abaixo.
 
-### Node novo: Bernini Region Mask
-
-Prepara a mascara antes de conectar no `region_mask`. Aceita uma `MASK` ou,
-opcionalmente, um `IMAGE` colorido em `image_mask` (qualquer pixel nao-preto
-vira regiao — igual ao `SCAIL2ColoredMask`). Faz `grow`/`blur`/`threshold`/
-`invert`. Saida: `MASK`.
-
-Fluxo tipico:
-
-```text
-SAM3_VideoTrack / SAM2 / desenho  ->  (IMAGE ou MASK)
-   -> Bernini Region Mask (grow/blur/threshold)
-      -> Bernini Infinity.region_mask  (mask_mode = inpaint ou bbox)
-```
-
-### Encaixe da imagem: stretch vs crop (`resize_mode`)
-
-Quando o aspect ratio do video de entrada nao bate com o `width`/`height`
-pedido, o `Bernini Infinity` agora deixa voce escolher no widget
-`resize_mode`:
-
-- `stretch` (padrao): estica pro tamanho exato, **sem cortar** nada das
-  bordas (pode distorcer um pouco se a proporcao for bem diferente).
-- `crop`: corta as bordas (center crop) pra preservar a proporcao — era o
-  comportamento antigo, que causava aquele "leve crop nas laterais".
-
-Bonus: a mascara passou a usar o **mesmo** encaixe da fonte, entao em `crop`
-ela continua alinhada com o video (antes a mascara esticava e a fonte
-cortava, desalinhando levemente a regiao).
-
-Dica pra nao distorcer **nem** cortar: ajuste `width`/`height` pra mesma
-proporcao do video de entrada (ex.: fonte 1920x1080 -> use 16:9 como 832x468
-arredondado pra multiplo de 16).
-
----
-
 ## Novidade 0.3.0 — Node novo: FaceStitchUpscale
 
 Cola o rosto de volta no video depois de um upscale, usando os `face_bboxes`
-do node "Pose and Face Detection" (ComfyUI-WanAnimatePreprocess / kijai).
-Resolve o problema de nao conseguir encaixar o rosto upscalado frame a frame.
-
-**Por que funciona:** o crop do WanAnimate e, por frame,
-`face = frame[y1:y2, x1:x2]` -> `cv2.resize(face, (512,512))`, e `face_bboxes`
-guarda exatamente `(x1,y1,x2,y2)` em pixels do frame original. Este node faz o
-inverso: redimensiona o rosto upscalado de volta para `(x2-x1, y2-y1)` e compoe
-na posicao certa, com borda suave. E 100% reversivel.
-
-**Fiacao:**
-
-```text
-Pose and Face Detection
-   |- face_images --> [seu upscale WAN] --> upscaled_faces -.
-   '- face_bboxes ------------------------> face_bboxes ----+
-                                                            |
-   video (original OU ja upscalado) ------> target_frames --+
-                                                            v
-                                                   FaceStitchUpscale
-                                                      |- images   (video final)
-                                                      '- face_mask (onde colou)
-```
-
-**Parametros:**
+do node "Pose and Face Detection".
 
 - `target_frames` — video onde o rosto sera colado.
 - `upscaled_faces` — rostos depois do upscale (mesma contagem de frames).
@@ -272,52 +116,38 @@ Exporta com mais opcoes que o VHS, criando pastas.
 - `save_png_sequence` + `png_in_subfolder` (pasta dedicada) + `png_prefix`.
 - `date_subfolder` (cria subpasta com a data), `pingpong`, `audio` opcional.
 - Saidas: `mp4_path`, `png_folder`.
+- 
+## Instalacao
 
-Backends em camadas: PyAV (vem com o ComfyUI) -> imageio-ffmpeg -> OpenCV.
-Se for usar imageio como backend: `pip install imageio imageio-ffmpeg`.
-O audio no MP4 e best-effort (precisa de PyAV ou ffmpeg no PATH).
+Copie a pasta `comfyui-bernini-long-conditioning` para:
 
-### FaceStitchUpscale: color_match
-Adicionado `color_match` (off/mean/mean_std) pra casar tom/exposicao do rosto
-novo com a regiao original e acabar com a mesclagem feia. E `mask_shape`
-(ellipse/rectangle) + `external_mask` (ligue uma mascara SAM2 se quiser).
+```text
+ComfyUI/custom_nodes/
+```
 
-### Face Crop Expand (Bruxos)
-Re-crop dos rostos com expansao controlavel (`scale`, `top_extra` p/ cabelo),
-crop quadrado real (sem estica-desestica). Gera `face_images` + `face_bboxes`
-expandidos — da mais contexto pro upscaler entender o sujeito.
+Depois reinicie o ComfyUI.
+
+## Por que nao ha um Bernini Long Sampler aqui?
+
+Porque, pelo comportamento descrito, o Bernini ja passa contexto pelo conditioning e o patch Wan ja aceita `context_latents` como lista. O ponto robusto e gerar varios conditionings corretos:
+
+```python
+context_latents = [
+    encoded_chunk,
+    tail_latent,
+]
+```
+
+Assim voce aproveita a arquitetura nativa em vez de clonar um sampler inteiro.
+
+Um executor automatico pode ser adicionado depois, mas ele precisa conhecer os nomes e chamadas exatas dos nodes/classes Bernini instalados na sua maquina. Este pacote deixa a parte importante isolada e compativel com o workflow existente.
+
 
 ---
 
-## Novidades 0.5.1
+🙏 Acknowledgements
+workflow usou como base aguns nodes criados pelo KIjai, e modelos do Bernini:
+agradecemos aos autores e a comunidade.
 
-- **Botao de upload** no node Load Video (Bruxos), via extensao JS em `web/`
-  (igual ao "choose video to upload" do VideoHelperSuite). Envia pra
-  `ComfyUI/input` e ja seleciona no widget.
-- **Explicacao em portugues** em todos os nodes: `DESCRIPTION` (aparece ao
-  passar o mouse no node) + `tooltip` em cada parametro dos nodes do pacote.
-
----
-
-## Novidades 0.6.0 — Prompt Guide multimodelo
-
-Node novo **Prompt Guide (Bruxos)** (`Bruxos do VFX/Prompt`), inspirado no
-Bernini Prompt Guide do Deno, mas com varios modelos. Cada tarefa e um "comando"
-com seu system prompt, e cada modelo tem negativos prontos.
-
-Modelos: **Bernini, Wan 2.2, Wan 2.1, LTX 2.3 (Edit Anything), Seedance 2**.
-
-- `model`: filtra as tarefas e negativos disponiveis (via extensao JS).
-- `task`: o comando; auto-preenche o `system_prompt` (editavel).
-- `negative_preset`: negativo pronto (ex: Wan2.2 oficial em chines e EN).
-- `prompt`: sua instrucao.
-- `clip` (opcional): se ligado, sai CONDITIONING; senao, use as saidas de texto.
-- Saidas: `positive`, `negative` (CONDITIONING), `positive_text`, `negative_text`.
-
-As tarefas do LTX 2.3 (Add / Remove / Replace / Style / Motion Transfer /
-Reference Add / Reference Replace) seguem o guia oficial do LoRA Edit Anything
-(ex: Remove = 4-10 palavras; Replace = descreva o antigo e o novo; Style =
-"Convert the video into a <STYLE> style").
-
-Obs.: os presets do Wan usam o negativo oficial difundido. Os de Seedance 2 e
-alguns do Bernini sao pontos de partida curados e 100% editaveis no node.
+📄 License
+Apache License 2.0.
