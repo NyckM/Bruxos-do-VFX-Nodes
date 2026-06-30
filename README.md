@@ -1,5 +1,5 @@
-<img width="832" height="480" alt="ChatGPT Image 30 de jun  de 2026, 11_28_48" src="https://github.com/user-attachments/assets/6745a8ce-00ce-4915-a60d-ed1354099311" />
-﻿# ComfyUI Bruxos do VFX
+[bruxos_runpod_setup.sh](https://github.com/user-attachments/files/29526644/bruxos_runpod_setup.sh)<img width="832" height="480" alt="ChatGPT Image 30 de jun  de 2026, 11_28_48" src="https://github.com/user-attachments/assets/6745a8ce-00ce-4915-a60d-ed1354099311" />
+﻿### ComfyUI Bruxos do VFX
 
 Custom nodes para usar Bernini/Wan com videos maiores que o limite comum de 81 frames sem criar um sampler Bernini novo.
 
@@ -14,6 +14,19 @@ Para cada chunk, ele injeta:
 - `context_latents: [encoded_chunk]`
 - se `tail_memory=True`, a partir do segundo chunk: `context_latents: [encoded_chunk, tail_latent]`
 - `context: {"video": encoded_chunk}` para compatibilidade com nodes que ainda leem o contexto antigo do Bernini
+
+Workflow para remover objetos e pessoas
+
+https://github.com/user-attachments/assets/1575f97f-34b9-492a-accb-818e97a6cbde
+
+resultados, tempo média de 96 frames em 204 segundos
+
+https://github.com/user-attachments/assets/d1e47486-ac3b-4030-be42-56a0f16b0128
+
+## Instalacao fácil
+
+Usando o Bat dentro da pasta de instalação do ComfyUI, assim ele já baixa os modelos e o custom node automaticamente para você
+versão para Runpod, ainda em desenvolvimento
 
 ## Novidades 0.2.0 / 0.2.1
 
