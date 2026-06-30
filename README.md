@@ -145,5 +145,10 @@ Um executor automatico pode ser adicionado depois, mas ele precisa conhecer os n
 
 ---
 
+🙏 Acknowledgements
+workflow usou como base aguns nodes criados pelo KIjai, e modelos do Bernini:
+agradecemos aos autores e a comunidade.
 
+📄 License
+Apache License 2.0.
 
