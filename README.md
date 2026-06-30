@@ -13,6 +13,29 @@ https://github.com/user-attachments/assets/d1e47486-ac3b-4030-be42-56a0f16b0128
 Usando o Bat dentro da pasta de instalação do ComfyUI, assim ele já baixa os modelos e o custom node automaticamente para você.
 Versão para Runpod, ainda em desenvolvimento
 
+## Instalacao
+
+Copie a pasta `comfyui-bernini-long-conditioning` para:
+
+```text
+ComfyUI/custom_nodes/
+```
+
+https://huggingface.co/neuregex/Bernini-R-GGUF/tree/main
+Modelo GGufs
+que vão instalados na pasta ComfyUI\models\unet
+
+https://huggingface.co/Cyph3r/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16
+lora que vai na pasta ComfyUI\models\lora 
+
+https://huggingface.co/Osrivers/umt5_xxl_fp8_e4m3fn_scaled.safetensors/tree/main
+Umt clip  que vai na pasta ComfyUI\models\clip
+
+https://huggingface.co/Kijai/WanVideo_comfy/blob/main/Wan2_1_VAE_bf16.safetensors
+vae que vai na pasta ComfyUI\models\vae
+
+Depois reinicie o ComfyUI.
+
 ### ComfyUI Bruxos do VFX
 
 Custom nodes para usar Bernini/Wan com videos maiores que o limite comum de 81 frames sem criar um sampler Bernini novo.
@@ -91,25 +114,6 @@ do node "Pose and Face Detection".
 - *Video upscalado + rosto em alta de verdade*: faca o upscale do video todo
   (ex.: 2x), ligue ESSE video em `target_frames` e use `bbox_scale = 2.0`.
 
----
-
-## Novidades 0.4.0
-
-Adicionados tres nodes:
-
-- **Pad to 4n+1 (Bruxos)** e **Trim 4n+1 back to N (Bruxos)** — envolva o
-  bloco Wan do seu workflow com esses dois nodes pra que `111` entre e `111`
-  saia. Padding por espelhamento ping-pong (sem frame congelado).
-- **Qwen-VL Caption (Bruxos)** — substituto direto do `Florence2Run`. Saida
-  `STRING`. Modos `single_frame` (= comportamento Florence) e
-  `keyframes_merge` (amostra varios frames e gera UM prompt unificado).
-  Requer `transformers>=4.45 accelerate pillow`.
-
-Veja `RELATORIO_MM_Upscale.md` para a integracao detalhada no workflow
-`MM_Upscale.json`.
-
----
-
 ## Novidades 0.5.0 — Video I/O (nodes 2.0)
 
 Dois nodes no estilo do VideoHelperSuite, mas compativeis com o tipo `VIDEO`
@@ -131,15 +135,6 @@ Exporta com mais opcoes que o VHS, criando pastas.
 - `date_subfolder` (cria subpasta com a data), `pingpong`, `audio` opcional.
 - Saidas: `mp4_path`, `png_folder`.
 - 
-## Instalacao
-
-Copie a pasta `comfyui-bernini-long-conditioning` para:
-
-```text
-ComfyUI/custom_nodes/
-```
-
-Depois reinicie o ComfyUI.
 
 ## Por que nao ha um Bernini Long Sampler aqui?
 
