@@ -15,39 +15,6 @@ Para cada chunk, ele injeta:
 - se `tail_memory=True`, a partir do segundo chunk: `context_latents: [encoded_chunk, tail_latent]`
 - `context: {"video": encoded_chunk}` para compatibilidade com nodes que ainda leem o contexto antigo do Bernini
 
-### Bernini Long Video Merge
-
-Recebe uma lista de videos renderizados e faz blend linear no overlap.
-Utilitarios para montar manualmente a lista de chunks renderizados antes do merge.
-
-## Instalacao
-
-Copie a pasta `comfyui-bernini-long-conditioning` para:
-
-```text
-ComfyUI/custom_nodes/
-```
-
-Depois reinicie o ComfyUI.
-
-## Por que nao ha um Bernini Long Sampler aqui?
-
-Porque, pelo comportamento descrito, o Bernini ja passa contexto pelo conditioning e o patch Wan ja aceita `context_latents` como lista. O ponto robusto e gerar varios conditionings corretos:
-
-```python
-context_latents = [
-    encoded_chunk,
-    tail_latent,
-]
-```
-
-Assim voce aproveita a arquitetura nativa em vez de clonar um sampler inteiro.
-
-Um executor automatico pode ser adicionado depois, mas ele precisa conhecer os nomes e chamadas exatas dos nodes/classes Bernini instalados na sua maquina. Este pacote deixa a parte importante isolada e compativel com o workflow existente.
-
-
----
-
 ## Novidades 0.2.0 / 0.2.1
 
 ### Correcao de frames (4n+1) — fim do "111 entra, 109 sai"
@@ -149,4 +116,34 @@ Exporta com mais opcoes que o VHS, criando pastas.
 - `save_png_sequence` + `png_in_subfolder` (pasta dedicada) + `png_prefix`.
 - `date_subfolder` (cria subpasta com a data), `pingpong`, `audio` opcional.
 - Saidas: `mp4_path`, `png_folder`.
+- 
+## Instalacao
+
+Copie a pasta `comfyui-bernini-long-conditioning` para:
+
+```text
+ComfyUI/custom_nodes/
+```
+
+Depois reinicie o ComfyUI.
+
+## Por que nao ha um Bernini Long Sampler aqui?
+
+Porque, pelo comportamento descrito, o Bernini ja passa contexto pelo conditioning e o patch Wan ja aceita `context_latents` como lista. O ponto robusto e gerar varios conditionings corretos:
+
+```python
+context_latents = [
+    encoded_chunk,
+    tail_latent,
+]
+```
+
+Assim voce aproveita a arquitetura nativa em vez de clonar um sampler inteiro.
+
+Um executor automatico pode ser adicionado depois, mas ele precisa conhecer os nomes e chamadas exatas dos nodes/classes Bernini instalados na sua maquina. Este pacote deixa a parte importante isolada e compativel com o workflow existente.
+
+
+---
+
+
 
