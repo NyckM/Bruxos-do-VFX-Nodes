@@ -1,105 +1,95 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-// Faz o node Prompt Guide (Bruxos) se comportar como o do Deno:
-//  - ao trocar 'model', filtra 'task' e 'negative_preset' para esse modelo
-//  - ao trocar 'task', auto-preenche 'system_prompt' com o texto do preset
-//  - ao trocar 'negative_preset', auto-preenche 'negative_prompt'
+// Botao de upload no node Load Video (Bruxos), espelhando o padrao do VHS.
+console.log("[Bruxos] extensao de upload de video carregada");
 
-let PRESETS = null;
-async function loadPresets() {
-  if (PRESETS) return PRESETS;
+function chainCallback(object, property, callback) {
+  if (object == undefined) return;
+  if (property in object) {
+    const orig = object[property];
+    object[property] = function () {
+      const r = orig.apply(this, arguments);
+      callback.apply(this, arguments);
+      return r;
+    };
+  } else {
+    object[property] = callback;
+  }
+}
+
+async function uploadFile(file) {
   try {
-    const r = await api.fetchApi("/bruxos/prompt_presets");
-    if (r.status === 200) PRESETS = await r.json();
+    const body = new FormData();
+    body.append("image", file);
+    const resp = await api.fetchApi("/upload/image", { method: "POST", body });
+    if (resp.status !== 200) {
+      alert("[Bruxos] upload falhou: " + resp.status + " - " + resp.statusText);
+      return null;
+    }
+    const data = await resp.json();
+    return data.subfolder ? data.subfolder + "/" + data.name : data.name;
   } catch (e) {
-    console.warn("[Bruxos] nao consegui carregar presets:", e);
-  }
-  return PRESETS;
-}
-
-function getWidget(node, name) {
-  return node.widgets?.find((w) => w.name === name);
-}
-
-function setComboOptions(widget, values, keepIfPossible) {
-  if (!widget) return;
-  widget.options = widget.options || {};
-  widget.options.values = values;
-  if (!(keepIfPossible && values.includes(widget.value))) {
-    widget.value = values[0];
+    alert("[Bruxos] erro no upload: " + e);
+    return null;
   }
 }
 
-function applyModel(node, model, fillTexts) {
-  if (!PRESETS || !PRESETS.presets[model]) return;
-  const p = PRESETS.presets[model];
-  const taskNames = Object.keys(p.tasks);
-  const negNames = Object.keys(p.negatives);
-  const taskW = getWidget(node, "task");
-  const negW = getWidget(node, "negative_preset");
-  setComboOptions(taskW, taskNames, true);
-  setComboOptions(negW, negNames, true);
-  if (fillTexts) {
-    fillSystem(node, model, taskW?.value);
-    fillNegative(node, model, negW?.value);
-  }
-  node.setDirtyCanvas(true, true);
-}
+function addUploadButton(nodeType, widgetName) {
+  chainCallback(nodeType.prototype, "onNodeCreated", function () {
+    const node = this;
+    const pathWidget = node.widgets?.find((w) => w.name === widgetName);
 
-function fillSystem(node, model, task) {
-  if (!PRESETS) return;
-  const p = PRESETS.presets[model];
-  if (!p) return;
-  const sysW = getWidget(node, "system_prompt");
-  if (sysW && task in p.tasks) {
-    sysW.value = p.tasks[task] || "";
-  }
-}
+    const fileInput = document.createElement("input");
+    chainCallback(node, "onRemoved", () => fileInput?.remove());
 
-function fillNegative(node, model, negName) {
-  if (!PRESETS) return;
-  const p = PRESETS.presets[model];
-  if (!p) return;
-  const negW = getWidget(node, "negative_prompt");
-  if (negW && negName in p.negatives) {
-    negW.value = p.negatives[negName] || "";
-  }
+    async function doUpload(file) {
+      const name = await uploadFile(file);
+      if (!name) return false;
+      if (pathWidget) {
+        pathWidget.options = pathWidget.options || {};
+        pathWidget.options.values = pathWidget.options.values || [];
+        if (!pathWidget.options.values.includes(name)) pathWidget.options.values.push(name);
+        pathWidget.value = name;
+        if (pathWidget.callback) pathWidget.callback(name);
+      }
+      app.graph.setDirtyCanvas(true, true);
+      return true;
+    }
+
+    Object.assign(fileInput, {
+      type: "file",
+      accept: "video/webm,video/mp4,video/x-matroska,image/gif,video/quicktime,.mp4,.mov,.mkv,.avi,.webm,.gif,.m4v,.wmv,.flv",
+      style: "display: none",
+      onchange: async () => {
+        if (fileInput.files.length) await doUpload(fileInput.files[0]);
+      },
+    });
+
+    // drag-and-drop direto no node
+    node.onDragOver = (e) => !!e?.dataTransfer?.types?.includes?.("Files");
+    node.onDragDrop = async function (e) {
+      if (!e?.dataTransfer?.types?.includes?.("Files")) return false;
+      const item = e.dataTransfer?.files?.[0];
+      if (item) return await doUpload(item);
+      return false;
+    };
+
+    document.body.append(fileInput);
+
+    const uploadWidget = node.addWidget("button", "\uD83D\uDCC1 escolher v\u00eddeo (upload)", "upload", () => {
+      app.canvas.node_widget = null;
+      fileInput.click();
+    });
+    uploadWidget.options.serialize = false;
+  });
 }
 
 app.registerExtension({
-  name: "BruxosDoVFX.PromptGuide",
+  name: "BruxosDoVFX.LoadVideoUpload",
   async beforeRegisterNodeDef(nodeType, nodeData) {
-    if (nodeData?.name !== "BruxosPromptGuide") return;
-    await loadPresets();
-
-    const onNodeCreated = nodeType.prototype.onNodeCreated;
-    nodeType.prototype.onNodeCreated = function () {
-      const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
-      const node = this;
-
-      const modelW = getWidget(node, "model");
-      const taskW = getWidget(node, "task");
-      const negW = getWidget(node, "negative_preset");
-
-      const wrap = (w, fn) => {
-        if (!w) return;
-        const prev = w.callback;
-        w.callback = function () {
-          const res = prev ? prev.apply(this, arguments) : undefined;
-          try { fn(); } catch (e) { console.warn("[Bruxos]", e); }
-          return res;
-        };
-      };
-
-      wrap(modelW, () => applyModel(node, modelW.value, true));
-      wrap(taskW, () => fillSystem(node, modelW?.value, taskW.value));
-      wrap(negW, () => fillNegative(node, modelW?.value, negW.value));
-
-      // estado inicial (sem sobrescrever textos que o usuario salvou no workflow)
-      loadPresets().then(() => applyModel(node, modelW?.value, false));
-
-      return r;
-    };
+    if (nodeData?.name === "BruxosLoadVideo") {
+      addUploadButton(nodeType, "video");
+    }
   },
 });

@@ -1,4 +1,4 @@
-# ComfyUI Bruxos do VFX
+﻿# ComfyUI Bruxos do VFX
 
 Custom nodes para usar Bernini/Wan com videos maiores que o limite comum de 81 frames sem criar um sampler Bernini novo.
 
