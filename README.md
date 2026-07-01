@@ -38,6 +38,10 @@ Depois reinicie o ComfyUI.
 
 ### ComfyUI Bruxos do VFX
 
+
+https://github.com/user-attachments/assets/e35f6caa-1b53-46bf-860d-90db0eb51b0f
+
+
 Custom nodes para usar Bernini/Wan com videos maiores que o limite comum de 81 frames sem criar um sampler Bernini novo.
 
 O node principal troca a logica de um `Bernini Conditioning` unico por condicionamentos em chunks:
