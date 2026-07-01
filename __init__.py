@@ -22,6 +22,8 @@ _merge("prompt_guide")
 _merge("loaders")
 _merge("utility_nodes")
 _merge("video_compare")
+_merge("mask_bbox_preview")
+_merge("simplifier_nodes")
 
 # ---- rota HTTP que serve os presets do Prompt Guide p/ a extensao JS ----
 try:
@@ -65,8 +67,43 @@ try:
             except Exception:
                 pass
             dur = (fc / fps) if fps else 0.0
-            return web.json_response({"width": w, "height": h, "fps": round(fps, 4),
-                                      "frame_count": fc, "duration": round(dur, 4)})
+
+            # --- calcula o recorte (skip / nth / cap / force_rate) igual ao decode_video ---
+            def _int(q, d=0):
+                try:
+                    return int(float(request.query.get(q, d)))
+                except Exception:
+                    return d
+            def _float(q, d=0.0):
+                try:
+                    return float(request.query.get(q, d))
+                except Exception:
+                    return d
+            skip = max(0, _int("skip_first_frames", 0))
+            nth = max(1, _int("select_every_nth", 1))
+            cap = max(0, _int("frame_load_cap", 0))
+            frate = max(0.0, _float("force_rate", 0.0))
+
+            avail = max(0, fc - skip)
+            if frate and fps:
+                avail = int(round(avail * (frate / fps)))
+            kept = 0 if avail <= 0 else ((avail - 1) // nth + 1)
+            if cap:
+                kept = min(kept, cap)
+            out_fps = frate if frate else (fps / nth if fps else 0.0)
+            trim_dur = (kept / out_fps) if out_fps else 0.0
+
+            return web.json_response({
+                "width": w, "height": h, "fps": round(fps, 4),
+                "frame_count": fc, "duration": round(dur, 4),
+                "trim_frames": int(kept), "trim_fps": round(out_fps, 4),
+                "trim_duration": round(trim_dur, 4),
+                "skip_first_frames": skip, "select_every_nth": nth,
+                "frame_load_cap": cap,
+                "start_time": round((skip / fps) if fps else 0.0, 4),
+                # span de tempo do arquivo original consumido (p/ o preview parar no cap)
+                "end_time": round(((skip + (kept * nth if not frate else avail * nth)) / fps) if fps else 0.0, 4),
+            })
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 except Exception as e:  # pragma: no cover

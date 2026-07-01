@@ -71,6 +71,16 @@ function ensurePreview(node) {
     renderInfo(node);
     node.setSize(node.computeSize());
     node.setDirtyCanvas(true, true);
+    // comeca no primeiro frame apos o skip
+    if (node._bruxosTrim) { try { video.currentTime = node._bruxosTrim.start; } catch (e) {} }
+  });
+  // mantem o preview dentro da janela de corte (skip .. cap), em loop
+  video.addEventListener("timeupdate", () => {
+    const t = node._bruxosTrim;
+    if (!t) return;
+    if (video.currentTime >= t.end - 0.001 || video.currentTime < t.start - 0.05) {
+      try { video.currentTime = t.start; } catch (e) {}
+    }
   });
   video.addEventListener("error", () => {
     node._bruxosPrev.info.textContent =
@@ -91,9 +101,24 @@ function renderInfo(node) {
   const W = py.width || m.w;
   const H = py.height || m.h;
   if (W && H) lines.push("resolucao : " + W + "x" + H);
-  if (py.frame_count) lines.push("frames    : " + py.frame_count + " (duracao em frames)");
+  if (py.frame_count) {
+    let l = "frames    : " + py.frame_count;
+    if (py.trim_frames != null && py.trim_frames !== py.frame_count)
+      l += "  ->  " + py.trim_frames + " apos corte";
+    lines.push(l);
+  }
   const secs = py.duration || m.dur;
-  if (secs) lines.push("duracao   : " + (Math.round(secs * 100) / 100) + "s");
+  if (secs) {
+    let l = "duracao   : " + (Math.round(secs * 100) / 100) + "s";
+    if (py.trim_duration != null && Math.abs(py.trim_duration - secs) > 0.01)
+      l += "  ->  " + (Math.round(py.trim_duration * 100) / 100) + "s";
+    lines.push(l);
+  }
+  if (py.skip_first_frames || (py.select_every_nth && py.select_every_nth > 1) || py.frame_load_cap) {
+    lines.push("corte     : pula " + (py.skip_first_frames || 0) +
+      " | 1 a cada " + (py.select_every_nth || 1) +
+      " | limite " + (py.frame_load_cap ? py.frame_load_cap : "-"));
+  }
   const f = py.output_fps || py.fps || py.source_fps;
   if (f) lines.push("fps       : " + (Math.round(f * 1000) / 1000));
   if (py.format) lines.push("formato   : " + py.format);
@@ -101,18 +126,42 @@ function renderInfo(node) {
   p.info.textContent = lines.join("\n");
 }
 
+// le os valores de corte dos widgets do node
+function trimParams(node) {
+  const g = (n) => {
+    const w = node.widgets && node.widgets.find((x) => x.name === n);
+    return w ? w.value : undefined;
+  };
+  return {
+    skip_first_frames: g("skip_first_frames"),
+    select_every_nth: g("select_every_nth"),
+    frame_load_cap: g("frame_load_cap"),
+    force_rate: g("force_rate"),
+  };
+}
+
 // pergunta ao servidor frames/resolucao/fps/duracao do arquivo escolhido
 function probeAndFill(node, ref, folderType) {
   if (!ref || !ref.filename) return;
   const sub = ref.subfolder ? encodeURIComponent(ref.subfolder) : "";
   const type = ref.type || folderType || "input";
-  const url = `/bruxos/video_probe?filename=${encodeURIComponent(ref.filename)}` +
+  let url = `/bruxos/video_probe?filename=${encodeURIComponent(ref.filename)}` +
               `&type=${type}&subfolder=${sub}`;
+  const tp = trimParams(node);
+  for (const k in tp) if (tp[k] != null && tp[k] !== "") url += `&${k}=${encodeURIComponent(tp[k])}`;
   api.fetchApi(url)
     .then((r) => (r.ok ? r.json() : null))
     .then((info) => {
       if (!info || info.error) return;
       node._bruxosPyInfo = Object.assign({}, node._bruxosPyInfo || {}, info);
+      // janela de corte pro preview (comeca no skip, para no cap)
+      if (info.start_time != null && info.end_time != null && info.end_time > info.start_time) {
+        node._bruxosTrim = { start: info.start_time, end: info.end_time };
+        const v = node._bruxosPrev && node._bruxosPrev.video;
+        if (v) { try { v.currentTime = info.start_time; } catch (e) {} }
+      } else {
+        node._bruxosTrim = null;
+      }
       renderInfo(node);
       node.setDirtyCanvas(true, true);
     })
@@ -156,6 +205,18 @@ function hookLoadVideo(node) {
       return r;
     };
   }
+  // ao mexer nos widgets de corte, re-consulta (atualiza contagem + janela do preview)
+  ["skip_first_frames", "select_every_nth", "frame_load_cap", "force_rate"].forEach((nm) => {
+    const w = node.widgets && node.widgets.find((x) => x.name === nm);
+    if (!w) return;
+    const o = w.callback;
+    w.callback = function () {
+      const r = o ? o.apply(this, arguments) : undefined;
+      const ref = refFromInputWidget(node);
+      if (ref) probeAndFill(node, ref, "input");
+      return r;
+    };
+  });
   const ref0 = refFromInputWidget(node);
   if (ref0) showVideo(node, ref0, "input");
 }

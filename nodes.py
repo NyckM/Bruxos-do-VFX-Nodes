@@ -387,16 +387,16 @@ class BerniniLongConditioning:
                 )
             )
 
-            if tail_memory and previous_generated_frames is not None:
+            if tail_memory and previous_chunk is not None:
 
                 tail_count = min(
                     int(tail_frames),
-                    int(previous_generated_frames.shape[0])
+                    int(previous_chunk.shape[0])
                 )
 
                 if tail_count > 0:
 
-                    tail = previous_generated_frames[-tail_count:]
+                    tail = previous_chunk[-tail_count:]
 
                     tail_latent = _encode_video(
                         vae,
@@ -416,7 +416,7 @@ class BerniniLongConditioning:
             latent_chunks.append(
                 {"samples": _make_empty_latent(int(chunk.shape[0]), int(width), int(height), int(batch_size))}
             )
-            previous_chunk = chunk
+            previous_chunk = source_chunk
 
         return (positive_chunks, negative_chunks, latent_chunks, chunks, ranges, len(chunks))
 
