@@ -1,276 +1,282 @@
-# -*- coding: utf-8 -*-
-"""
-Loader Tudo-em-1 (Bruxos) — carrega, num unico node:
-  - modelo HIGH (safetensors via UNETLoader ou .gguf via UnetLoaderGGUF) + LoRA high
-  - modelo LOW  (idem) + LoRA low
-  - CLIP (safetensors via CLIPLoader ou .gguf via CLIPLoaderGGUF)
-  - VAE
-Reaproveita os nodes ja instalados (core + ComfyUI-GGUF), entao as listas de
-arquivos e as opcoes ficam sempre iguais as dos loaders originais.
-"""
+import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 
-import inspect
-import json
-import os
-import struct
+// Preview de video (DOM widget, Nodes 2.0) para Load Video (Bruxos) e
+// Save Video (Bruxos), + infos do video no Load.
+console.log("[Bruxos] preview de video carregado");
 
-try:
-    import folder_paths as _fp
-except Exception:
-    _fp = None
+const MAX_H = 240;   // altura maxima do player
+const INFO_H = 46;   // area de texto de infos
 
-try:
-    import nodes as _nodes
-except Exception:
-    _nodes = None
+function viewURL(ref, folderType) {
+  const sub = ref.subfolder ? encodeURIComponent(ref.subfolder) : "";
+  const type = ref.type || folderType || "input";
+  return api.apiURL(
+    `/view?filename=${encodeURIComponent(ref.filename)}` +
+    `&type=${type}&subfolder=${sub}&rand=${Math.random().toString(36).slice(2)}`
+  );
+}
 
+function ensurePreview(node) {
+  if (node._bruxosPrev) return node._bruxosPrev;
 
-def _registry():
-    return getattr(_nodes, "NODE_CLASS_MAPPINGS", {}) if _nodes else {}
+  const wrap = document.createElement("div");
+  wrap.style.cssText =
+    "width:100%;box-sizing:border-box;display:block;overflow:hidden;";
 
+  const video = document.createElement("video");
+  video.muted = true;
+  video.loop = true;
+  video.autoplay = true;
+  video.playsInline = true;
+  video.controls = true;
+  // min-width:0 / max-width:100% evitam que o video vaze do node
+  video.style.cssText =
+    "display:block;width:100%;max-width:100%;min-width:0;height:auto;" +
+    "max-height:" + MAX_H + "px;object-fit:contain;background:#000;" +
+    "border-radius:6px;";
 
-def _get_cls(key):
-    cls = _registry().get(key)
-    if cls is None and _nodes is not None:
-        cls = getattr(_nodes, key, None)
-    return cls
+  const info = document.createElement("div");
+  info.style.cssText =
+    "width:100%;box-sizing:border-box;margin-top:4px;font-size:10px;" +
+    "line-height:1.35;color:#bbb;font-family:monospace;white-space:pre-wrap;" +
+    "word-break:break-word;text-align:left;";
 
+  wrap.append(video, info);
 
-def _opts(node_key, field, section="required"):
-    """Le as opcoes (lista de arquivos / combos) direto do INPUT_TYPES do loader
-    original, pra nunca ficar desatualizado em relacao a versao do ComfyUI."""
-    cls = _get_cls(node_key)
-    if cls is None:
-        return []
-    try:
-        it = cls.INPUT_TYPES()
-        entry = it.get(section, {}).get(field)
-        if entry and isinstance(entry[0], (list, tuple)):
-            return list(entry[0])
-    except Exception:
-        pass
-    return []
+  const widget = node.addDOMWidget("bruxos_preview", "preview", wrap, {
+    serialize: false,
+    hideOnZoom: false,
+  });
 
+  widget.computeSize = function (width) {
+    let h = INFO_H;
+    if (node._bruxosPrev && node._bruxosPrev.video.style.display !== "none") {
+      const aspect = node._bruxosMeta && node._bruxosMeta.aspect;
+      const w = (node.size && node.size[0] ? node.size[0] : width) - 20;
+      if (aspect) h += Math.min(MAX_H, Math.max(60, w / aspect)) + 8;
+      else h += 160;
+    }
+    return [width, h];
+  };
 
-def _dedupe(seq):
-    seen = set()
-    out = []
-    for x in seq:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+  video.addEventListener("loadedmetadata", () => {
+    node._bruxosMeta = {
+      w: video.videoWidth,
+      h: video.videoHeight,
+      dur: video.duration,
+      aspect: video.videoWidth && video.videoHeight
+        ? video.videoWidth / video.videoHeight : null,
+    };
+    renderInfo(node);
+    node.setSize(node.computeSize());
+    node.setDirtyCanvas(true, true);
+  });
+  video.addEventListener("error", () => {
+    node._bruxosPrev.info.textContent =
+      "(preview indisponivel para este arquivo neste navegador)";
+    node.setDirtyCanvas(true, true);
+  });
 
+  node._bruxosPrev = { wrap, video, info, widget };
+  return node._bruxosPrev;
+}
 
-def _model_list():
-    lst = _dedupe(_opts("UNETLoader", "unet_name") + _opts("UnetLoaderGGUF", "unet_name"))
-    return lst if lst else ["None"]
+function renderInfo(node) {
+  const p = node._bruxosPrev;
+  if (!p) return;
+  const m = node._bruxosMeta || {};
+  const py = node._bruxosPyInfo || {};
+  const lines = [];
+  const W = py.width || m.w;
+  const H = py.height || m.h;
+  if (W && H) lines.push("resolucao : " + W + "x" + H);
+  if (py.frame_count) {
+    let l = "frames    : " + py.frame_count;
+    if (py.trim_frames != null && py.trim_frames !== py.frame_count)
+      l += "  ->  " + py.trim_frames + " apos corte";
+    lines.push(l);
+  }
+  const secs = py.duration || m.dur;
+  if (secs) {
+    let l = "duracao   : " + (Math.round(secs * 100) / 100) + "s";
+    if (py.trim_duration != null && Math.abs(py.trim_duration - secs) > 0.01)
+      l += "  ->  " + (Math.round(py.trim_duration * 100) / 100) + "s";
+    lines.push(l);
+  }
+  if (py.skip_first_frames || (py.select_every_nth && py.select_every_nth > 1) || py.frame_load_cap) {
+    lines.push("corte     : pula " + (py.skip_first_frames || 0) +
+      " | 1 a cada " + (py.select_every_nth || 1) +
+      " | limite " + (py.frame_load_cap ? py.frame_load_cap : "-"));
+  }
+  const f = py.output_fps || py.fps || py.source_fps;
+  if (f) lines.push("fps       : " + (Math.round(f * 1000) / 1000));
+  if (py.format) lines.push("formato   : " + py.format);
+  if (py.has_audio != null) lines.push("audio     : " + (py.has_audio ? "sim" : "nao"));
+  p.info.textContent = lines.join("\n");
+}
 
+// monta a URL do preview JA CORTADO (servidor aplica skip/cap/nth/force_rate)
+function previewURL(node, ref) {
+  const tp = trimParams(node);
+  const p = new URLSearchParams();
+  p.set("filename", ref.filename);
+  p.set("type", ref.type || "input");
+  p.set("subfolder", ref.subfolder || "");
+  p.set("maxside", "360");
+  for (const k in tp) if (tp[k] != null && tp[k] !== "") p.set(k, tp[k]);
+  // token por seleção: garante que o navegador nunca reuse o preview de OUTRO video
+  p.set("v", (node._bruxosPrevVer || 0).toString());
+  return api.apiURL("/bruxos/video_preview?" + p.toString());
+}
 
-def _clip_list():
-    lst = _dedupe(_opts("CLIPLoader", "clip_name") + _opts("CLIPLoaderGGUF", "clip_name"))
-    return lst if lst else ["None"]
+// recarrega o preview cortado (debounce p/ nao spammar ao arrastar slider)
+function refreshPreview(node) {
+  const p = ensurePreview(node);
+  const ref = refFromInputWidget(node);
+  if (!ref) return;
+  node._bruxosPrevVer = (node._bruxosPrevVer || 0) + 1;  // URL unica por atualizacao
+  if (node._bruxosPrevTimer) clearTimeout(node._bruxosPrevTimer);
+  node._bruxosPrevTimer = setTimeout(() => {
+    p.video.src = previewURL(node, ref);
+    p.video.style.display = "block";
+    p.video.play && p.video.play().catch(() => {});
+    node.setSize(node.computeSize());
+    node.setDirtyCanvas(true, true);
+  }, 250);
+  probeAndFill(node, ref, "input");   // atualiza os numeros (frames apos corte)
+}
 
+// le os valores de corte dos widgets do node
+function trimParams(node) {
+  const g = (n) => {
+    const w = node.widgets && node.widgets.find((x) => x.name === n);
+    return w ? w.value : undefined;
+  };
+  return {
+    skip_first_frames: g("skip_first_frames"),
+    select_every_nth: g("select_every_nth"),
+    frame_load_cap: g("frame_load_cap"),
+    force_rate: g("force_rate"),
+  };
+}
 
-def _vae_list():
-    lst = _opts("VAELoader", "vae_name")
-    return lst if lst else ["None"]
+// pergunta ao servidor frames/resolucao/fps/duracao do arquivo escolhido
+function probeAndFill(node, ref, folderType) {
+  if (!ref || !ref.filename) return;
+  const sub = ref.subfolder ? encodeURIComponent(ref.subfolder) : "";
+  const type = ref.type || folderType || "input";
+  let url = `/bruxos/video_probe?filename=${encodeURIComponent(ref.filename)}` +
+              `&type=${type}&subfolder=${sub}`;
+  const tp = trimParams(node);
+  for (const k in tp) if (tp[k] != null && tp[k] !== "") url += `&${k}=${encodeURIComponent(tp[k])}`;
+  api.fetchApi(url)
+    .then((r) => (r.ok ? r.json() : null))
+    .then((info) => {
+      if (!info || info.error) return;
+      node._bruxosPyInfo = Object.assign({}, node._bruxosPyInfo || {}, info);
+      renderInfo(node);
+      node.setDirtyCanvas(true, true);
+    })
+    .catch(() => {});
+}
 
+function showVideo(node, ref, folderType) {
+  const p = ensurePreview(node);
+  if (!ref || !ref.filename) return;
+  p.video.src = viewURL(ref, folderType);
+  p.video.style.display = "block";
+  p.video.play && p.video.play().catch(() => {});
+  node.setSize(node.computeSize());
+  node.setDirtyCanvas(true, true);
+  probeAndFill(node, ref, folderType);   // preenche frames/resolucao na hora
+}
 
-def _lora_list():
-    return ["None"] + _opts("LoraLoaderModelOnly", "lora_name")
+function refFromInputWidget(node) {
+  const w = node.widgets && node.widgets.find((x) => x.name === "video");
+  const pathW = node.widgets && node.widgets.find((x) => x.name === "video_path");
+  if (pathW && pathW.value && String(pathW.value).trim()) return null;
+  if (!w || !w.value) return null;
+  const val = String(w.value).replace(/\\/g, "/");
+  const idx = val.lastIndexOf("/");
+  return {
+    filename: idx >= 0 ? val.slice(idx + 1) : val,
+    subfolder: idx >= 0 ? val.slice(0, idx) : "",
+    type: "input",
+  };
+}
 
+function hookLoadVideo(node) {
+  ensurePreview(node);
+  const vWidget = node.widgets && node.widgets.find((x) => x.name === "video");
+  if (vWidget) {
+    const orig = vWidget.callback;
+    vWidget.callback = function () {
+      const r = orig ? orig.apply(this, arguments) : undefined;
+      refreshPreview(node);
+      return r;
+    };
+  }
+  // ao mexer nos widgets de corte, re-renderiza o preview cortado + numeros
+  ["skip_first_frames", "select_every_nth", "frame_load_cap", "force_rate"].forEach((nm) => {
+    const w = node.widgets && node.widgets.find((x) => x.name === nm);
+    if (!w) return;
+    const o = w.callback;
+    w.callback = function () {
+      const r = o ? o.apply(this, arguments) : undefined;
+      refreshPreview(node);
+      return r;
+    };
+  });
+  refreshPreview(node);
+}
 
-def _clip_types():
-    t = _opts("CLIPLoader", "type")
-    return t if t else ["wan"]
+app.registerExtension({
+  name: "BruxosDoVFX.VideoPreview",
+  async beforeRegisterNodeDef(nodeType, nodeData) {
+    const name = nodeData && nodeData.name;
+    if (name === "BruxosLoadVideo") {
+      const onCreated = nodeType.prototype.onNodeCreated;
+      nodeType.prototype.onNodeCreated = function () {
+        const r = onCreated ? onCreated.apply(this, arguments) : undefined;
+        hookLoadVideo(this);
+        return r;
+      };
+      const onExec = nodeType.prototype.onExecuted;
+      nodeType.prototype.onExecuted = function (message) {
+        if (onExec) onExec.apply(this, arguments);
+        try {
+          if (message && message.bruxos_info && message.bruxos_info[0]) {
+            this._bruxosPyInfo = JSON.parse(message.bruxos_info[0]);
+            renderInfo(this);
+          }
+          // mantem o preview no video SELECIONADO (cortado), nao troca pelo
+          // que veio na mensagem (evita "pular" p/ outro arquivo).
+          const sel = refFromInputWidget(this);
+          if (sel) refreshPreview(this);
+          else if (message && message.bruxos_video && message.bruxos_video[0])
+            showVideo(this, message.bruxos_video[0], "input");
+        } catch (e) { console.warn("[Bruxos] info parse", e); }
+      };
+    }
 
-
-def _weight_dtypes():
-    d = _opts("UNETLoader", "weight_dtype")
-    return d if d else ["default"]
-
-
-def _clip_devices():
-    d = _opts("CLIPLoader", "device", section="optional")
-    return d if d else ["default", "cpu"]
-
-
-def _call(cls, **kwargs):
-    """Instancia o loader e chama sua FUNCTION passando so os kwargs que ela aceita."""
-    if cls is None:
-        raise RuntimeError("loader nao encontrado")
-    inst = cls()
-    fn = getattr(inst, getattr(cls, "FUNCTION"))
-    try:
-        params = inspect.signature(fn).parameters
-        accepted = {k: v for k, v in kwargs.items() if k in params}
-    except (ValueError, TypeError):
-        accepted = kwargs
-    return fn(**accepted)
-
-
-def _resolved_path(name, folder_keys):
-    if _fp is None or not name:
-        return None
-    for k in folder_keys:
-        try:
-            p = _fp.get_full_path(k, name)
-            if p:
-                return p
-        except Exception:
-            pass
-    return None
-
-
-def _validate(name, folder_keys, kind):
-    """Confere se o arquivo existe e tem formato valido. Erro claro em PT caso
-    contrario (cobre o caso de node com valores antigos/desalinhados)."""
-    if not name or name == "None":
-        raise RuntimeError(f"[Bruxos Loader] nenhum {kind} selecionado.")
-    p = _resolved_path(name, folder_keys)
-    if not p or not os.path.isfile(p):
-        raise RuntimeError(
-            f"[Bruxos Loader] {kind} '{name}' nao encontrado. Em geral isso acontece "
-            f"quando o node foi salvo numa versao anterior e os campos sairam de lugar: "
-            f"APAGUE e RECRIE o node, e selecione os arquivos de novo."
-        )
-    low = name.lower()
-    size = os.path.getsize(p)
-    try:
-        if low.endswith(".gguf"):
-            with open(p, "rb") as f:
-                if f.read(4) != b"GGUF":
-                    raise ValueError("magic gguf invalido")
-        elif low.endswith((".safetensors", ".sft")):
-            with open(p, "rb") as f:
-                head = f.read(8)
-                if len(head) < 8:
-                    raise ValueError("arquivo curto demais")
-                n = struct.unpack("<Q", head)[0]
-                if n <= 0 or 8 + n > size:
-                    raise ValueError("tamanho de header invalido/incompleto")
-                hdr = f.read(n)
-                if len(hdr) < n:
-                    raise ValueError("header truncado (download incompleto)")
-                json.loads(hdr.decode("utf-8"))  # valida o JSON de verdade
-    except Exception:
-        raise RuntimeError(
-            f"[Bruxos Loader] o arquivo de {kind} '{name}' ({os.path.basename(p)}, "
-            f"{size} bytes) parece CORROMPIDO ou INCOMPLETO (header invalido). "
-            f"Quase sempre e download pela metade: REBAIXE esse arquivo e tente de novo. "
-            f"Se for um .gguf, escolha o loader/arquivo certo."
-        )
-    return p
-
-
-def _default(seq, prefer=()):
-    for p in prefer:
-        if p in seq:
-            return p
-    return seq[0] if seq else "None"
-
-
-def _is_gguf_path(path, name=""):
-    """Detecta gguf pelos bytes magicos (mais confiavel que a extensao)."""
-    if name and str(name).lower().endswith(".gguf"):
-        return True
-    try:
-        with open(path, "rb") as f:
-            return f.read(4) == b"GGUF"
-    except Exception:
-        return False
-
-
-class BruxosWanAllInOneLoader:
-    @classmethod
-    def INPUT_TYPES(cls):
-        models = _model_list()
-        clips = _clip_list()
-        vaes = _vae_list()
-        loras = _lora_list()
-        types = _clip_types()
-        wdtypes = _weight_dtypes()
-        devices = _clip_devices()
-        return {
-            "required": {
-                "high_model": (models, {"tooltip": "Modelo de ruido ALTO (high noise). Aceita .safetensors ou .gguf."}),
-                "high_lora": (loras, {"tooltip": "LoRA aplicada no modelo high. 'None' = sem LoRA."}),
-                "high_lora_strength": ("FLOAT", {"default": 3.0, "min": -100.0, "max": 100.0, "step": 0.05, "tooltip": "Forca da LoRA high (seu fluxo usa ~3.0)."}),
-                "low_model": (models, {"tooltip": "Modelo de ruido BAIXO (low noise). Aceita .safetensors ou .gguf."}),
-                "low_lora": (loras, {"tooltip": "LoRA aplicada no modelo low. 'None' = sem LoRA."}),
-                "low_lora_strength": ("FLOAT", {"default": 1.5, "min": -100.0, "max": 100.0, "step": 0.05, "tooltip": "Forca da LoRA low (seu fluxo usa ~1.5)."}),
-                "clip_name": (clips, {"tooltip": "Text encoder / CLIP. Aceita .safetensors ou .gguf."}),
-                "clip_type": (types, {"default": _default(types, ("wan",))}),
-                "vae_name": (vaes, {"tooltip": "VAE."}),
-            },
-            "optional": {
-                "weight_dtype": (wdtypes, {"default": _default(wdtypes, ("default",)),
-                                           "tooltip": "Precisao do UNET safetensors (ignorado em .gguf)."}),
-                "clip_device": (devices, {"default": _default(devices, ("default",)),
-                                          "tooltip": "Dispositivo do CLIP (default/cpu)."}),
-            },
-        }
-
-    RETURN_TYPES = ("MODEL", "MODEL", "CLIP", "VAE")
-    RETURN_NAMES = ("model_high", "model_low", "clip", "vae")
-    FUNCTION = "load_all"
-    CATEGORY = "Bruxos do VFX/Loaders"
-    DESCRIPTION = ("Carrega tudo num node so: modelo high+LoRA, modelo low+LoRA, CLIP e VAE. "
-                   "Entrada principal de modelos aceita safetensors OU gguf (detecta pela extensao "
-                   "e usa o loader certo). Reaproveita os loaders ja instalados.")
-
-    # ---- loaders internos ----
-    def _load_unet(self, name, weight_dtype):
-        p = _validate(name, ["diffusion_models", "unet", "unet_gguf", "diffusion_models_gguf"], "modelo")
-        if _is_gguf_path(p, name):
-            cls = _get_cls("UnetLoaderGGUF")
-            if cls is None:
-                raise RuntimeError("Pra carregar .gguf preciso do node ComfyUI-GGUF (UnetLoaderGGUF). "
-                                   "Instale/atualize o ComfyUI-GGUF, ou selecione um .safetensors.")
-            return _call(cls, unet_name=name)[0]
-        cls = _get_cls("UNETLoader")
-        if cls is None:
-            raise RuntimeError("UNETLoader (core) nao encontrado.")
-        return _call(cls, unet_name=name, weight_dtype=weight_dtype)[0]
-
-    def _apply_lora(self, model, lora_name, strength):
-        if not lora_name or lora_name == "None" or abs(float(strength)) < 1e-9:
-            return model
-        cls = _get_cls("LoraLoaderModelOnly")
-        if cls is None:
-            return model
-        return _call(cls, model=model, lora_name=lora_name, strength_model=float(strength))[0]
-
-    def _load_clip(self, clip_name, clip_type, clip_device):
-        p = _validate(clip_name, ["text_encoders", "clip", "clip_gguf"], "CLIP/text encoder")
-        if _is_gguf_path(p, clip_name):
-            cls = _get_cls("CLIPLoaderGGUF")
-            if cls is None:
-                raise RuntimeError("Pra carregar CLIP .gguf preciso do node ComfyUI-GGUF (CLIPLoaderGGUF).")
-            return _call(cls, clip_name=clip_name, type=clip_type, clip_type=clip_type)[0]
-        cls = _get_cls("CLIPLoader")
-        if cls is None:
-            raise RuntimeError("CLIPLoader (core) nao encontrado.")
-        return _call(cls, clip_name=clip_name, type=clip_type, device=clip_device)[0]
-
-    def _load_vae(self, vae_name):
-        _validate(vae_name, ["vae"], "VAE")
-        cls = _get_cls("VAELoader")
-        if cls is None:
-            raise RuntimeError("VAELoader (core) nao encontrado.")
-        return _call(cls, vae_name=vae_name)[0]
-
-    def load_all(self, high_model, high_lora, high_lora_strength,
-                 low_model, low_lora, low_lora_strength,
-                 clip_name, clip_type, vae_name,
-                 weight_dtype="default", clip_device="default"):
-        model_high = self._apply_lora(self._load_unet(high_model, weight_dtype), high_lora, high_lora_strength)
-        model_low = self._apply_lora(self._load_unet(low_model, weight_dtype), low_lora, low_lora_strength)
-        clip = self._load_clip(clip_name, clip_type, clip_device)
-        vae = self._load_vae(vae_name)
-        return (model_high, model_low, clip, vae)
-
-
-NODE_CLASS_MAPPINGS = {"BruxosWanAllInOneLoader": BruxosWanAllInOneLoader}
-NODE_DISPLAY_NAME_MAPPINGS = {"BruxosWanAllInOneLoader": "Loader Tudo-em-1 Wan (Bruxos)"}
+    if (name === "BruxosSaveVideo") {
+      const onCreated = nodeType.prototype.onNodeCreated;
+      nodeType.prototype.onNodeCreated = function () {
+        const r = onCreated ? onCreated.apply(this, arguments) : undefined;
+        ensurePreview(this);
+        return r;
+      };
+      const onExec = nodeType.prototype.onExecuted;
+      nodeType.prototype.onExecuted = function (message) {
+        if (onExec) onExec.apply(this, arguments);
+        const ref = message && (
+          (message.gifs && message.gifs[0]) ||
+          (message.videos && message.videos[0]) ||
+          (message.images && message.images[0])
+        );
+        if (ref) showVideo(this, ref, "output");
+      };
+    }
+  },
+});
