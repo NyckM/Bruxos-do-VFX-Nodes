@@ -8,6 +8,9 @@ resultados, tempo média de 96 frames em 204 segundos
 
 https://github.com/user-attachments/assets/d1e47486-ac3b-4030-be42-56a0f16b0128
 
+
+Essa ferramenta foi desenvolvida especificamente para duas produções: Dr Monstro de Marcos jorge e Alice júnior 2 de Gil Baroni.
+dois longas metragens com alguns vfx realizados aqui na produtora bruxos do VFX, onde a demanda gerou a necessidade de criar a ferramenta de remoção de objetos para auxiliar na composição e integração das cenas. 
 ## Instalacao fácil
 
 Usando o Bat dentro da pasta de instalação do ComfyUI, assim ele já baixa os modelos e o custom node automaticamente para você.
