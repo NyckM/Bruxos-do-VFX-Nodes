@@ -55,7 +55,19 @@ Para cada chunk, ele injeta:
 - `context_latents: [encoded_chunk]`
 - se `tail_memory=True`, a partir do segundo chunk: `context_latents: [encoded_chunk, tail_latent]`
 - `context: {"video": encoded_chunk}` para compatibilidade com nodes que ainda leem o contexto antigo do Bernini
+sequential vs context_window — qual é a diferença?
 
+Ambos controlam como o node processa um vídeo maior do que um único chunk, mas fazem isso de formas bem diferentes.
+
+O sequential processa o vídeo em chunks, um após o outro, avançando chunk_size − overlap frames a cada etapa. A opção tail_memory reutiliza alguns frames já editados do chunk anterior como contexto para o próximo, ajudando a manter a continuidade. É o modo mais simples e econômico em VRAM, porém, como o modelo é executado novamente em cada janela sobreposta, usar um chunk_size pequeno com um overlap muito grande pode aumentar drasticamente o número de execuções (por exemplo: chunk=17 e overlap=16 → avanço de apenas 1 frame → 61 passagens). Importante: o modo de máscara bbox não é utilizado no sequential; ele faz fallback automaticamente para inpaint.
+
+O context_window trata o vídeo inteiro como uma única geração, mas fornece ao modelo uma janela deslizante com os frames vizinhos como contexto. Em vez de unir várias execuções independentes, o modelo leva em consideração os frames ao redor para manter a consistência temporal ao longo de todo o vídeo. Esse modo geralmente produz movimentos e continuidade mais suaves, além de ser o único em que a máscara bbox funciona, permitindo o ganho de desempenho por meio do recorte da região de interesse.
+
+Regra prática:
+
+Vídeos curtos que cabem em uma única execução: ambos funcionam, mas context_window oferece melhor consistência e habilita o uso de bbox.
+Vídeos muito longos ou com VRAM limitada: use sequential, preferencialmente com um chunk_size grande e um overlap pequeno para reduzir a quantidade de passagens.
+Quer economizar tempo e VRAM usando o recorte por bbox? Então é necessário usar context_window. No modo sequential, o bbox é ignorado.
 ## Novidades 0.2.0 / 0.2.1
 
 ### Correcao de frames (4n+1) — fim do "111 entra, 109 sai"
