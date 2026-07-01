@@ -71,14 +71,15 @@ function ensurePreview(node) {
     renderInfo(node);
     node.setSize(node.computeSize());
     node.setDirtyCanvas(true, true);
-    // comeca no primeiro frame apos o skip
-    if (node._bruxosTrim) { try { video.currentTime = node._bruxosTrim.start; } catch (e) {} }
+    applyTrimWindow(node);            // recalcula janela com a duracao real
+    const t = node._bruxosTrim;
+    if (t) { try { video.currentTime = t.start; } catch (e) {} }
   });
   // mantem o preview dentro da janela de corte (skip .. cap), em loop
   video.addEventListener("timeupdate", () => {
     const t = node._bruxosTrim;
     if (!t) return;
-    if (video.currentTime >= t.end - 0.001 || video.currentTime < t.start - 0.05) {
+    if (video.currentTime >= t.end - 0.02 || video.currentTime < t.start - 0.05) {
       try { video.currentTime = t.start; } catch (e) {}
     }
   });
@@ -126,6 +127,14 @@ function renderInfo(node) {
   p.info.textContent = lines.join("\n");
 }
 
+// converte a fracao (0..1) em segundos usando a duracao REAL do video carregado
+function applyTrimWindow(node) {
+  const f = node._bruxosTrimFrac;
+  const v = node._bruxosPrev && node._bruxosPrev.video;
+  if (!f || !v || !isFinite(v.duration) || v.duration <= 0) { node._bruxosTrim = null; return; }
+  node._bruxosTrim = { start: f.start * v.duration, end: f.end * v.duration };
+}
+
 // le os valores de corte dos widgets do node
 function trimParams(node) {
   const g = (n) => {
@@ -154,12 +163,14 @@ function probeAndFill(node, ref, folderType) {
     .then((info) => {
       if (!info || info.error) return;
       node._bruxosPyInfo = Object.assign({}, node._bruxosPyInfo || {}, info);
-      // janela de corte pro preview (comeca no skip, para no cap)
-      if (info.start_time != null && info.end_time != null && info.end_time > info.start_time) {
-        node._bruxosTrim = { start: info.start_time, end: info.end_time };
+      // janela de corte pro preview (comeca no skip, para no cap) — via FRACAO
+      if (info.end_frac != null && info.end_frac > (info.start_frac || 0)) {
+        node._bruxosTrimFrac = { start: info.start_frac || 0, end: info.end_frac };
+        applyTrimWindow(node);
         const v = node._bruxosPrev && node._bruxosPrev.video;
-        if (v) { try { v.currentTime = info.start_time; } catch (e) {} }
+        if (v && node._bruxosTrim) { try { v.currentTime = node._bruxosTrim.start; } catch (e) {} }
       } else {
+        node._bruxosTrimFrac = null;
         node._bruxosTrim = null;
       }
       renderInfo(node);
@@ -240,7 +251,15 @@ app.registerExtension({
             this._bruxosPyInfo = JSON.parse(message.bruxos_info[0]);
             renderInfo(this);
           }
-          if (message && message.bruxos_video && message.bruxos_video[0]) {
+          // NAO troca o preview pelo que veio na mensagem (evita "pular" p/ outro
+          // arquivo). Mantem o video SELECIONADO no seletor. So mostra o da
+          // mensagem se o seletor estiver vazio (ex.: entrada por caminho).
+          const sel = refFromInputWidget(this);
+          if (sel) {
+            const cur = this._bruxosPrev && this._bruxosPrev.video && this._bruxosPrev.video.src;
+            if (!cur) showVideo(this, sel, "input");
+            else { const ref = refFromInputWidget(this); if (ref) probeAndFill(this, ref, "input"); }
+          } else if (message && message.bruxos_video && message.bruxos_video[0]) {
             showVideo(this, message.bruxos_video[0], "input");
           }
         } catch (e) { console.warn("[Bruxos] info parse", e); }
