@@ -1,7 +1,7 @@
 ﻿[project]
 name = "ComfyUI-Bruxos-do-VFX"
 description = "Custom nodes by Bruxos do VFX: Bernini long video, face upscale stitch, 4n+1 fix, Qwen caption, and native video load/save."
-version = "0.9.5"
+version = "0.10.0"
 license = { text = "MIT" }
 
 [tool.comfy]

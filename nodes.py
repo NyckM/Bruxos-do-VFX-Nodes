@@ -523,7 +523,25 @@ class BerniniLongInfo:
 
 
 def _decode_video(vae, latent_samples, tiled=False):
-    images = vae.decode_tiled(latent_samples) if tiled else vae.decode(latent_samples)
+    if tiled:
+        # Passa tile/overlap explicitos: em algumas versoes do ComfyUI o
+        # decode_tiled 3D deixa overlap=None num eixo e quebra em "tile - overlap".
+        try:
+            images = vae.decode_tiled(
+                latent_samples,
+                tile_x=256, tile_y=256, overlap=64,
+                tile_t=32, overlap_t=8,
+            )
+        except TypeError:
+            # assinaturas mais antigas nao aceitam tile_t/overlap_t
+            try:
+                images = vae.decode_tiled(latent_samples, tile_x=256, tile_y=256, overlap=64)
+            except Exception:
+                images = vae.decode(latent_samples)
+        except Exception:
+            images = vae.decode(latent_samples)
+    else:
+        images = vae.decode(latent_samples)
     if len(images.shape) == 5:
         images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
     return images
