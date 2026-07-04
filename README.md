@@ -53,6 +53,10 @@ Reinicie o ComfyUI.
 - **FaceStitchUpscale** — cola o rosto upscalado de volta no vídeo usando os `face_bboxes` do Pose and Face Detection.
 - **Editor de Pontos SAM3** — clique **verde = selecionar**, **roxo = negar** sobre o frame, pra fixar o alvo do tracking (mais estável que prompt de texto puro).
 
+**Face / Troca de rosto** *(módulo companheiro `ComfyUI-Bruxos-FaceFusion` — ver abaixo)*
+- **FaceFusion Swap (Bruxos)** — troca de rosto **100% local** (ONNX, sem API). Aceita imagem única ou vídeo inteiro (batch), 13 modelos de swapper (`hyperswap_1c_256` recomendado, `inswapper_128_fp16` mais rápido), `pixel_boost` até 1024, seleção de rosto `one`/`many`/`reference` e máscaras combináveis (box + oclusão xseg + região bisenet + área). Sai já com uma **MASK dos rostos** que liga direto no `region_mask` do Bernini Infinity.
+- **FaceFusion Detectar Rostos (Bruxos)** — preview com caixas verdes e landmarks roxos, MASK por frame e contagem. Útil pra calibrar `score_threshold`/`face_position` antes do swap, ou gerar máscara de rosto pro Bernini sem trocar nada.
+
 **Vídeo**
 - **Load Video** / **Save Video** — equivalentes ao VHS com tipo `VIDEO` nativo (nodes 2.0), preview já cortado por skip/cap/nth/force_rate, export com mais controle de codec/CRF.
 - **Comparar Vídeos A/B** — player embutido (cortina, lado a lado, diferença, alternar) pra conferir antes/depois sem sair do Comfy.
@@ -62,7 +66,29 @@ Reinicie o ComfyUI.
 - **Config de Upscale** / **Blend de Batches** — super-nodes que substituem os subgraphs de Settings/Blend Frames.
 
 **Utilidades**
-- Crescer+Borrar Máscara, Máscara em Blocos, Nitidez Inteligente, Texto/Mostrar Texto, Seed, Carregar Imagens da Pasta, Info do Vídeo, Loader Tudo-em-1 Wan, Qwen-VL Caption, Prompt Guide (presets oficiais Bernini).
+- Crescer+Borrar Máscara, Máscara em Blocos, **Desenhar Máscara na Imagem** (visualização — pinta a máscara existente sobre a imagem, não seleciona/clica), **Face Crop Expand**, Nitidez Inteligente, Texto/Mostrar Texto, Seed, Carregar Imagens da Pasta, Info do Vídeo, Loader Tudo-em-1 Wan, Qwen-VL Caption, Prompt Guide (presets oficiais Bernini).
+
+---
+
+## Módulo de troca de rosto (FaceFusion)
+
+Os nodes de face swap moram no pacote companheiro **`ComfyUI-Bruxos-FaceFusion`** e são instalados **à parte** — de propósito: eles dependem de `onnxruntime-gpu`/`opencv`, e misturar isso com a instalação principal aumenta o risco de mexer no stack `torch 2.8 + CUDA` que já funciona.
+
+```text
+cd C:\Users\nyckm\Documents\c3\ComfyUI-Easy-Install
+.\python_embeded\python.exe -m pip install onnx onnxruntime-gpu opencv-python requests tqdm
+```
+Copie a pasta `ComfyUI-Bruxos-FaceFusion` para `ComfyUI/custom_nodes/` e reinicie. Os `.onnx` (swapper, scrfd, arcface, xseg, bisenet) baixam sozinhos no 1º uso, do [facefusion-assets](https://github.com/facefusion/facefusion-assets/releases/), para `ComfyUI/models/facefusion/`.
+
+> **Nunca** rode `pip` solto (resolve pro Python errado) nem instale `xformers`/`flash-attn` neste ambiente.
+> Se os nodes não aparecerem, o console mostra `[Bruxos FaceFusion] Dependência faltando` — é só instalar as libs acima.
+
+Categoria no menu: **Bruxos do VFX/Face**. Encaixe típico:
+```text
+Load Image (rosto novo) ─→ source_face ─┐
+Load Video ─────────────→ target_images ─┴→ FaceFusion Swap ─images→ Save Video
+                                              └─face_mask→ Bernini Infinity (region_mask) / Comparar A/B
+```
 
 ---
 
@@ -80,6 +106,8 @@ Reinicie o ComfyUI.
 
 **`mask_mode`:** `off` (regenera tudo) · `inpaint` (edita só a área da máscara, resto = fonte) · `bbox` (recorta a região, gera em resolução menor — só em `context_window`).
 
+**`bbox_compose`** *(no modo `bbox`)*: `silhouette` compõe usando a própria silhueta da máscara como alpha; `rectangle` cola o **retângulo inteiro** do bbox com feather nas bordas (usa `mask_blur` como feather) — elimina a "linha" de contorno que aparecia na composição por silhueta.
+
 ---
 
 ## Changelog (principais marcos)
@@ -89,6 +117,8 @@ Reinicie o ComfyUI.
 - **0.5** — Load/Save Video com tipo `VIDEO` nativo (nodes 2.0).
 - **0.6–0.9** — suíte de utilitários próprios (reduz dependência de terceiros), Comparar Vídeos A/B, Prever BBox da Máscara, Config de Upscale / Blend de Batches, preview de corte no Load Video direto no servidor.
 - **0.10** — Editor de Pontos SAM3 (seleção verde/negação roxa) para tracking mais estável.
+- **0.11** — `bbox_compose` (`silhouette`/`rectangle`): o modo `rectangle` cola o retângulo do bbox com feather (`mask_blur`) e elimina a "linha" de contorno na composição `bbox`; a máscara passa a acompanhar o `resize_mode` (`stretch`/`crop`) da fonte.
+- **Face swap** — módulo companheiro `ComfyUI-Bruxos-FaceFusion`: troca de rosto local (ONNX) com **FaceFusion Swap** e **Detectar Rostos**, saída de máscara integrada ao Bernini.
 
 ---
 
@@ -106,8 +136,8 @@ Assim o pacote aproveita a arquitetura nativa em vez de clonar um sampler inteir
 
 ## 🙏 Agradecimentos
 
-Baseado em nodes do **Kijai** e nos modelos **Bernini**. Obrigado aos autores e à comunidade.
+Baseado em nodes do **Kijai** e nos modelos **Bernini**. O módulo de troca de rosto reconstrói o [FaceFusion ComfyUI](https://github.com/huygiatrng/Facefusion_comfyui) (huygiatrng) em modo local. Obrigado aos autores e à comunidade.
 
 ## 📄 Licença
 
-Apache License 2.0.
+Apache License 2.0. O módulo companheiro FaceFusion é MIT (engine ONNX vendorizado) — **respeite as licenças dos modelos** de swap: vários são non-commercial (InsightFace); os `ghost_*` são Apache-2.0.
