@@ -1,8 +1,9 @@
-﻿[project]
+[project]
 name = "ComfyUI-Bruxos-do-VFX"
-description = "Custom nodes by Bruxos do VFX: Bernini long video, face upscale stitch, 4n+1 fix, Qwen caption, and native video load/save."
-version = "0.10.0"
+description = "Custom nodes by Bruxos do VFX: Bernini long video, face upscale stitch, 4n+1 fix, Qwen caption, native video load/save, and local FaceFusion face swap (ONNX)."
+version = "0.12.0"
 license = { text = "MIT" }
+dependencies = ["onnxruntime-gpu", "opencv-python", "onnx", "requests", "tqdm"]
 
 [tool.comfy]
 PublisherId = "bruxos-do-vfx"

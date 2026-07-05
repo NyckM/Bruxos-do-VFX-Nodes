@@ -25,6 +25,8 @@ _merge("video_compare")
 _merge("mask_bbox_preview")
 _merge("simplifier_nodes")
 _merge("points_editor")
+_merge("timing_nodes")  # cronometro passthrough (fallback ao selo automatico)
+_merge("facefusion_nodes")  # face swap local (ONNX) — so carrega se onnxruntime/opencv presentes
 
 # ---- rota HTTP que serve os presets do Prompt Guide p/ a extensao JS ----
 try:
@@ -210,6 +212,13 @@ try:
 except Exception as e:  # pragma: no cover
     import logging
     logging.info(f"[Bruxos do VFX] rota de presets nao registrada (ok fora do server): {e}")
+
+# Banner de inicializacao (logo Bruxos em ASCII verde/roxo)
+try:
+    from .banner import print_banner
+    print_banner(node_count=len(NODE_CLASS_MAPPINGS), version="0.12.0")
+except Exception:
+    pass
 
 # Extensoes JS (botao de upload, prompt guide, etc.)
 WEB_DIRECTORY = "./web"

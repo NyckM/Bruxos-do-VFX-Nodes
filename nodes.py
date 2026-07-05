@@ -182,8 +182,47 @@ def _grow_blur_mask(m, grow=0, blur=0):
         x = torch.nn.functional.conv2d(x, kw, padding=(0, blur))
     return x.squeeze(1).clamp(0.0, 1.0)
 
-
 def _resize_mask_spatial_temporal(m, T, H, W, mode="stretch"):
+    """m: [Tm,Hm,Wm] -> [T,H,W]. Usa o MESMO encaixe (stretch/crop) do vídeo,
+    para máscara e fonte ficarem alinhadas. Tempo por amostragem nearest."""
+    Tm = int(m.shape[0])
+    crop = _FIT_CROP.get(mode, "disabled")
+
+    m = comfy.utils.common_upscale(
+        m.unsqueeze(1),
+        int(W),
+        int(H),
+        "bilinear",
+        crop,
+    ).squeeze(1)
+
+    if Tm != int(T):
+        idx = (
+            torch.linspace(0, Tm - 1, steps=int(T))
+            .round()
+            .long()
+            .clamp(0, Tm - 1)
+        )
+        m = m[idx]
+
+    return m
+
+def _rect_feather_mask(n, ch, cw, feather, device=None):
+    """Alpha retangular [n,ch,cw]: 1.0 no interior, com borda suave (feather px)
+    caindo pra 0 nas bordas do retangulo. Usado pra compor pelo BBOX (sem a
+    linha do contorno da silhueta)."""
+    device = device or torch.device("cpu")
+    ys = torch.arange(ch, dtype=torch.float32, device=device).view(ch, 1)
+    xs = torch.arange(cw, dtype=torch.float32, device=device).view(1, cw)
+    f = max(1, int(feather))
+    dist_y = torch.minimum(ys, (ch - 1) - ys)
+    dist_x = torch.minimum(xs, (cw - 1) - xs)
+    edge = torch.minimum(dist_y, dist_x)              # dist ate a borda mais proxima
+    alpha = (edge / float(f)).clamp(0.0, 1.0)         # 0 na borda -> 1 apos feather px
+    return alpha.unsqueeze(0).expand(n, ch, cw).contiguous()
+
+
+
     """m: [Tm,Hm,Wm] -> [T,H,W]. Usa o MESMO encaixe (stretch/crop) do video,
     pra mascara e fonte ficarem alinhadas. Tempo por amostragem nearest."""
     Tm = int(m.shape[0])
@@ -720,6 +759,7 @@ class BerniniInfinity:
                 "mask_grow": ("INT", {"default": 0, "min": -256, "max": 256, "step": 1, "tooltip": "Dilata (+) ou contrai (-) a mascara, em pixels. Use + pra pegar uma margem ao redor do objeto; - pra apertar a regiao."}),
                 "mask_blur": ("INT", {"default": 6, "min": 0, "max": 256, "step": 1, "tooltip": "Suaviza a borda da mascara (feather), em pixels. Evita emenda dura entre a area gerada e a fonte. 0 = borda seca."}),
                 "mask_pad": ("INT", {"default": 16, "min": 0, "max": 1024, "step": 16, "tooltip": "[mask_mode=bbox] Folga em pixels ao redor da caixa da mascara antes de recortar. Mais folga = menos risco de cortar o objeto, porem recorte maior (mais lento)."}),
+                "bbox_compose": (["silhouette", "rectangle"], {"default": "silhouette", "tooltip": "[mask_mode=bbox] Como colar de volta. silhouette = usa o contorno da mascara como alpha (pode deixar uma linha na borda do objeto). rectangle = cola o retangulo INTEIRO do bbox com feather nas bordas do retangulo (sem linha do contorno; use quando o fundo dentro do bbox tambem pode ser regenerado)."}),
                 "resize_mode": (["stretch", "crop"], {"default": "stretch", "tooltip": "Encaixe quando a proporcao do video difere de width/height. stretch = estica pro tamanho exato, SEM cortar (pode distorcer um pouco). crop = corta as bordas mantendo a proporcao."}),
             },
             "optional": {
@@ -783,6 +823,7 @@ class BerniniInfinity:
         mask_grow=0,
         mask_blur=6,
         mask_pad=16,
+        bbox_compose="silhouette",
         resize_mode="stretch",
         region_mask=None,
         reference_video=None,
@@ -813,6 +854,7 @@ class BerniniInfinity:
                 ref_max_size, reference_video, reference_images, context_jitter,
                 region_mask=region_mask, mask_mode=mask_mode,
                 mask_grow=mask_grow, mask_blur=mask_blur, mask_pad=mask_pad,
+                bbox_compose=bbox_compose,
                 resize_mode=resize_mode,
             )
         return self._render_sequential(
@@ -924,6 +966,15 @@ class BerniniInfinity:
             # mantem so a area selecionada: fora da mascara volta a ser a fonte
             if use_mask:
                 cm = seq_mask[start:end][:true_len].unsqueeze(-1).to(imgs.device, imgs.dtype)
+                cov = float(cm.mean().item())
+                if cov < 0.005:
+                    print(
+                        f"[Bernini Infinity][seq] AVISO chunk {chunk_index + 1}/{total_chunks}: "
+                        f"mascara ~vazia ({cov * 100:.2f}% branca) nos frames {start}..{end - 1} -> "
+                        f"nada sera editado neste bloco. Provavel perda de tracking do SAM3 no fim do "
+                        f"video; ancore o alvo no 1o frame (Points Editor) ou reforce o prompt do SAM3.",
+                        flush=True,
+                    )
                 src_px = source_chunk[:true_len].to(imgs.device, imgs.dtype)
                 imgs = src_px * (1.0 - cm) + imgs * cm
 
@@ -961,6 +1012,7 @@ class BerniniInfinity:
         chunk_size, overlap, target, decode_tiled, decode_chunk,
         ref_max_size, reference_video, reference_images, context_jitter,
         region_mask=None, mask_mode="off", mask_grow=0, mask_blur=0, mask_pad=16,
+        bbox_compose="silhouette",
         resize_mode="stretch",
     ):
         target = int(target)
@@ -1000,6 +1052,7 @@ class BerniniInfinity:
                 seed, sampler, high_sigmas, low_sigmas, cfg,
                 decode_tiled, decode_chunk, ref_max_size,
                 reference_video, reference_images, int(mask_pad),
+                bbox_compose=bbox_compose, feather=int(mask_blur),
             )
         if use_mask and mask_mode == "bbox" and use_ctx:
             print("[Bernini Infinity][ctx] bbox indisponivel com janelas; "
@@ -1058,6 +1111,20 @@ class BerniniInfinity:
             src = full_source.cpu()
             n = min(gen.shape[0], src.shape[0], mask_full.shape[0])
             m = mask_full[:n].unsqueeze(-1).cpu()
+            # diagnostico: aponta frames onde a mascara chega ~vazia (perda de tracking)
+            try:
+                per_frame = m.reshape(n, -1).mean(dim=1)
+                empty = [i for i in range(n) if float(per_frame[i]) < 0.005]
+                if empty:
+                    faixa = f"{empty[0]}..{empty[-1]}" if len(empty) > 1 else f"{empty[0]}"
+                    print(
+                        f"[Bernini Infinity][ctx] AVISO: mascara ~vazia em {len(empty)}/{n} frame(s) "
+                        f"(faixa {faixa}) -> Bernini nao edita ali (fica a fonte). Provavel perda de "
+                        f"tracking do SAM3 no fim do video; ancore no 1o frame (Points Editor).",
+                        flush=True,
+                    )
+            except Exception:
+                pass
             result_imgs = src[:n] * (1.0 - m) + gen[:n] * m
 
         if result_imgs.shape[0] > target:
@@ -1080,6 +1147,7 @@ class BerniniInfinity:
         seed, sampler, high_sigmas, low_sigmas, cfg,
         decode_tiled, decode_chunk, ref_max_size,
         reference_video, reference_images, mask_pad,
+        bbox_compose="silhouette", feather=6,
     ):
         x0, y0, x1, y1 = _mask_bbox(mask_full, int(mask_pad), 16, int(width), int(height))
         cw, ch = x1 - x0, y1 - y0
@@ -1121,10 +1189,17 @@ class BerniniInfinity:
             crop_imgs = _decode_video(vae, crop_latent, bool(decode_tiled))
         crop_imgs = crop_imgs.cpu()
 
-        # cola de volta: fora da bbox = fonte original; dentro = blend pela mascara
+        # cola de volta: fora da bbox = fonte original; dentro = blend pelo alpha
         out = full_source.clone().cpu()
         n = min(out.shape[0], crop_imgs.shape[0])
-        blend = mask_crop[:n].unsqueeze(-1).cpu()                 # [n,ch,cw,1]
+        if bbox_compose == "rectangle":
+            # alpha = retangulo INTEIRO do bbox com feather nas bordas do retangulo
+            # (sem a linha do contorno da silhueta)
+            blend = _rect_feather_mask(n, ch, cw, int(feather)).unsqueeze(-1).cpu()
+            print(f"[Bernini Infinity][bbox] compose=rectangle (feather={int(feather)}px, "
+                  f"sem linha de contorno)", flush=True)
+        else:
+            blend = mask_crop[:n].unsqueeze(-1).cpu()            # [n,ch,cw,1] silhueta
         region = out[:n, y0:y1, x0:x1, :]
         out[:n, y0:y1, x0:x1, :] = region * (1.0 - blend) + crop_imgs[:n] * blend
 
