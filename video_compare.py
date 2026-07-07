@@ -38,6 +38,14 @@ def _encode_temp(images, fps, prefix):
     name = f"{prefix}_{int(time.time()*1000)}.mp4"
     path = os.path.join(tmp, name)
     frames = _to_uint8(images)
+    # libx264 (yuv420p) EXIGE largura e altura PARES. Se vier impar (ex.: 861x487
+    # apos um resize/upscale), corta 1 px pra virar par -> evita
+    # "width not divisible by 2" e "Could not open encoder".
+    h0, w0 = frames.shape[1], frames.shape[2]
+    h2, w2 = h0 - (h0 % 2), w0 - (w0 % 2)
+    if (h2, w2) != (h0, w0):
+        frames = frames[:, :h2, :w2, :]
+        logging.info(f"[Bruxos Compare] dimensao impar {w0}x{h0} -> ajustada p/ {w2}x{h2} (par, exigencia do h264)")
     fps = float(fps) if fps and fps > 0 else 24.0
 
     # backend 1: imageio-ffmpeg (h264 yuv420p, compativel com <video>)

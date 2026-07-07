@@ -38,7 +38,8 @@ class FaceParser:
                     return False
             
             # Create ONNX session
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            from ..runtime import resolve_providers
+            providers = resolve_providers()
             self.model_session = ort.InferenceSession(model_path, providers=providers)
             
             # print(f"[FaceParser] Model {self.model_name} loaded, running on: {self.model_session.get_providers()[0]}")

@@ -106,6 +106,7 @@ class BruxosFaceFusionSwap:
                 'out_mask_grow': ('INT', {'default': 0, 'min': 0, 'max': 256, 'tooltip': 'So afeta a saida MASK (slot face_mask), nao o swap. Dilata a caixa dos rostos em pixels antes de gerar a mascara.'}),
                 'out_mask_blur': ('INT', {'default': 6, 'min': 0, 'max': 128, 'tooltip': 'So afeta a saida MASK (slot face_mask). Suaviza a borda (feather) da mascara de rostos que sai pro Bernini/compose.'}),
                 'max_workers': ('INT', {'default': 4, 'min': 1, 'max': 16, 'tooltip': 'Quantos frames processar em paralelo (video). Mais = mais rapido, porem mais VRAM/CPU. Baixe p/ 1-2 se estourar memoria.'}),
+                'device': (['auto', 'cuda', 'cpu'], {'default': 'auto', 'tooltip': 'Onde rodar os modelos ONNX. auto = usa a GPU (CUDA) se o onnxruntime tiver; senao CPU. cuda = forca GPU (se nao houver, avisa no console e usa CPU). cpu = forca CPU. Se cair na CPU sem querer, e conflito de pacote onnxruntime (veja o aviso no console).'}),
             },
             'optional': {
                 'reference_face': ('IMAGE', {'tooltip': '[modo reference] Rosto de referencia p/ escolher QUEM trocar no alvo. Se vazio, usa o proprio source_face como referencia.'}),
@@ -134,7 +135,10 @@ class BruxosFaceFusionSwap:
                 score_threshold, reference_distance, use_occlusion_mask, face_occluder_model,
                 use_region_mask, face_parser_model, use_area_mask, face_mask_areas,
                 face_mask_regions, face_mask_padding, out_mask_grow, out_mask_blur,
-                max_workers, reference_face=None):
+                max_workers, device='auto', reference_face=None):
+
+        from .facefusion.engine.runtime import set_device
+        set_device(device)
 
         if target_images.dim() == 3:
             target_images = target_images.unsqueeze(0)
@@ -249,16 +253,18 @@ class BruxosFaceFusionDetector:
                 'max_faces': ('INT', {'default': 0, 'min': 0, 'max': 64, 'tooltip': 'Limita quantos rostos considerar por frame. 0 = todos.'}),
                 'mask_grow': ('INT', {'default': 0, 'min': 0, 'max': 256, 'tooltip': 'Dilata a caixa dos rostos (px) antes de gerar a mascara de saida.'}),
                 'mask_blur': ('INT', {'default': 6, 'min': 0, 'max': 128, 'tooltip': 'Suaviza a borda (feather) da mascara de rostos, em pixels.'}),
+                'device': (['auto', 'cuda', 'cpu'], {'default': 'auto', 'tooltip': 'Onde rodar o detector ONNX. auto = GPU (CUDA) se disponivel, senao CPU. cuda = forca GPU (avisa no console se nao houver). cpu = forca CPU.'}),
             },
         }
 
-    RETURN_TYPES = ('IMAGE', 'MASK', 'INT', 'STRING')
-    RETURN_NAMES = ('preview', 'face_mask', 'faces_first_frame', 'info')
+    RETURN_TYPES = ('IMAGE', 'MASK', 'INT', 'STRING', 'BBOX')
+    RETURN_NAMES = ('preview', 'face_mask', 'faces_first_frame', 'info', 'face_bboxes')
     OUTPUT_TOOLTIPS = (
         'Preview com caixas verdes e landmarks roxos sobre cada rosto (mais o indice e o score).',
         'Mascara dos rostos por frame (branco = rosto). Pronta p/ o region_mask do Bernini.',
         'Quantos rostos foram achados no PRIMEIRO frame (util p/ calibrar face_position no Swap).',
         'Relatorio por frame (quantos rostos em cada um).',
+        'Caixa do rosto principal por frame (x1,y1,x2,y2). Liga no Face Crop Expand e no FaceStitchUpscale. Em frames sem rosto, repete a ultima caixa (nao pula).',
     )
     FUNCTION = 'process'
     CATEGORY = 'Bruxos do VFX/Face'
@@ -269,12 +275,16 @@ class BruxosFaceFusionDetector:
     )
 
     def process(self, images, face_detector_model, score_threshold, sort_order,
-                max_faces, mask_grow, mask_blur):
+                max_faces, mask_grow, mask_blur, device='auto'):
+        from .facefusion.engine.runtime import set_device
+        set_device(device)
         if images.dim() == 3:
             images = images.unsqueeze(0)
         n, h, w = images.shape[0], images.shape[1], images.shape[2]
 
         previews, masks, lines = [], [], []
+        face_bboxes = []          # 1 bbox por frame (rosto principal), p/ Crop/Stitch
+        last_box = None           # carry-forward: repete a ultima caixa em frames sem rosto
         first_count = 0
         for i in range(n):
             frame = tensor_to_cv2(images[i:i + 1])
@@ -292,6 +302,15 @@ class BruxosFaceFusionDetector:
                 if f.get('landmarks') is not None:
                     for (lx, ly) in np.asarray(f['landmarks']).reshape(-1, 2):
                         cv2.circle(vis, (int(lx), int(ly)), 2, (247, 85, 168), -1)  # roxo
+            # bbox do rosto principal (o 1o apos o sort) p/ este frame
+            if faces:
+                bx = [float(v) for v in faces[0]['bbox'][:4]]
+                last_box = (bx[0], bx[1], bx[2], bx[3])
+            # se nao achou rosto neste frame, repete a ultima caixa (nao pula/some)
+            if last_box is not None:
+                face_bboxes.append(last_box)
+            else:
+                face_bboxes.append((0.0, 0.0, float(w), float(h)))  # fallback: frame inteiro
             previews.append(cv2_to_tensor(vis).squeeze(0)[..., :3])
             masks.append(_faces_to_mask(faces, h, w, mask_grow, mask_blur))
             if i < 32:
@@ -302,7 +321,8 @@ class BruxosFaceFusionDetector:
         return (torch.stack(previews),
                 torch.from_numpy(np.stack(masks)).float(),
                 first_count,
-                '\n'.join(lines))
+                '\n'.join(lines),
+                face_bboxes)
 
 
 NODE_CLASS_MAPPINGS = {

@@ -26,6 +26,9 @@ _merge("mask_bbox_preview")
 _merge("simplifier_nodes")
 _merge("points_editor")
 _merge("timing_nodes")  # cronometro passthrough (fallback ao selo automatico)
+_merge("tracking_nodes")  # camera/objeto/pontos — puxa os trackers instalados (estilo Bernini)
+_merge("tracking_export")  # exporta trajetoria de camera pro VFX (JSON + Nuke .chan)
+_merge("tracking_visualizer")  # desenha os tracks sobre o video (destino visual dos pontos)
 _merge("facefusion_nodes")  # face swap local (ONNX) — so carrega se onnxruntime/opencv presentes
 
 # ---- rota HTTP que serve os presets do Prompt Guide p/ a extensao JS ----

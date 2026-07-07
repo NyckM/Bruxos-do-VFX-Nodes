@@ -16,7 +16,11 @@ const COR_TEXTO   = "#0b0b0d";
 const tempos = {};      // nodeId -> { start, end }  (em ms, performance.now)
 let rodando = null;     // id do node em execucao
 let rafOn = false;
-let ligado = true;      // liga/desliga pela engrenagem de settings
+let ligado = true;      // liga/desliga o selo (canvas, Node 1)
+let modoTitulo = true;  // escreve o tempo no titulo (funciona no Node 2.0/Vue)
+let _ultTitulo = 0;     // ultimo instante em que atualizei o titulo (throttle)
+
+const MARK = " \u23F1";  // delimitador do sufixo no titulo (relogio)
 
 function fmt(seg) {
   if (seg < 60) return seg.toFixed(1) + "s";
@@ -25,9 +29,43 @@ function fmt(seg) {
   return m + "m" + (s < 10 ? "0" : "") + s.toFixed(1) + "s";
 }
 
+// ---- tempo no titulo do node (render-mode-agnostico: Node 1 E Node 2.0) ----
+function tituloBase(node) {
+  if (node.__bruxosBaseTitle == null) {
+    const t = node.title || "";
+    node.__bruxosBaseTitle = t.split(MARK)[0].replace(/\s+$/, "");
+  }
+  return node.__bruxosBaseTitle;
+}
+function setTituloTempo(node, txt) {
+  if (!modoTitulo) return;
+  const base = tituloBase(node);
+  try { node.title = txt ? `${base}${MARK} ${txt}` : base; } catch (e) {}
+}
+function restauraTitulos() {
+  const nodes = app.graph?._nodes || [];
+  for (const node of nodes) {
+    if (node.__bruxosBaseTitle != null) {
+      try { node.title = node.__bruxosBaseTitle; } catch (e) {}
+    }
+  }
+  app.graph?.setDirtyCanvas(true, false);
+}
+
 // enquanto algo roda, redesenha p/ o contador subir ao vivo
+// enquanto algo roda, atualiza o tempo AO VIVO (no titulo p/ Node 2.0, e redesenha
+// o canvas p/ o selo do Node 1)
 function tick() {
   if (rodando != null) {
+    const t = tempos[rodando];
+    if (t && t.end == null) {
+      const agora = performance.now();
+      if (agora - _ultTitulo > 250) {   // ~4x por segundo (nao pesa o Vue)
+        _ultTitulo = agora;
+        const node = app.graph?.getNodeById?.(Number(rodando));
+        if (node) setTituloTempo(node, "\u25B6 " + fmt((agora - t.start) / 1000));
+      }
+    }
     app.graph?.setDirtyCanvas(true, false);
     requestAnimationFrame(tick);
   } else {
@@ -41,22 +79,28 @@ function garanteRaf() {
 
 // ---- eventos de execucao do ComfyUI ----
 api.addEventListener("execution_start", () => {
-  // novo run: fecha qualquer node aberto
   if (rodando != null && tempos[rodando]) tempos[rodando].end = performance.now();
   rodando = null;
+  restauraTitulos();
 });
 
 api.addEventListener("executing", (e) => {
   const id = e.detail;             // id do node, ou null quando termina tudo
   const agora = performance.now();
-  if (rodando != null && tempos[rodando]) tempos[rodando].end = agora;
+  if (rodando != null && tempos[rodando]) {
+    tempos[rodando].end = agora;
+    const nprev = app.graph?.getNodeById?.(Number(rodando));
+    if (nprev) setTituloTempo(nprev, fmt((tempos[rodando].end - tempos[rodando].start) / 1000));
+  }
   if (id === null || id === undefined) { rodando = null; resumo(); return; }
   tempos[id] = { start: agora, end: null };
   rodando = id;
+  const node = app.graph?.getNodeById?.(Number(id));
+  if (node) setTituloTempo(node, "\u25B6");   // ▶ rodando
   garanteRaf();
 });
 
-// resumo ordenado no console (sem precisar de node nenhum no fluxo)
+// resumo ordenado no console (sem precisar de node nenhum no fluxo; funciona em qualquer modo)
 function resumo() {
   const linhas = [];
   let total = 0;
@@ -66,7 +110,7 @@ function resumo() {
     const seg = (t.end - t.start) / 1000;
     total += seg;
     const node = app.graph?.getNodeById?.(Number(id));
-    const nome = node ? (node.title || node.type || id) : id;
+    const nome = node ? (tituloBase(node) || node.type || id) : id;
     linhas.push({ node: nome, tempo: fmt(seg), seg });
   }
   if (!linhas.length) return;
@@ -80,6 +124,8 @@ api.addEventListener("executed", (e) => {
   const id = e.detail?.node;
   if (id != null && tempos[id] && tempos[id].end == null) {
     tempos[id].end = performance.now();
+    const node = app.graph?.getNodeById?.(Number(id));
+    if (node) setTituloTempo(node, fmt((tempos[id].end - tempos[id].start) / 1000));
   }
 });
 
@@ -98,7 +144,8 @@ function desenhaSeloEm(node, ctx, ox, oy, w, h) {
   const padX = 6, hh = 16;
   const ww = ctx.measureText(label).width + padX * 2;
   const x = ox + w - ww - 6;
-  const y = oy + h - hh - 4;
+  // na linha do rodape (borda de baixo), ao lado do badge "Bruxos-do-VFX"
+  const y = oy + h - hh / 2;
 
   const r = 7;
   ctx.beginPath();
@@ -156,10 +203,17 @@ app.registerExtension({
     // toggle na engrenagem de configuracoes
     app.ui?.settings?.addSetting?.({
       id: "Bruxos.NodeTimer.enabled",
-      name: "Bruxos: mostrar timer em cada node",
+      name: "Bruxos: mostrar timer em cada node (selo, Node 1)",
       type: "boolean",
       defaultValue: true,
       onChange: (v) => { ligado = !!v; app.graph?.setDirtyCanvas(true, false); },
+    });
+    app.ui?.settings?.addSetting?.({
+      id: "Bruxos.NodeTimer.titleMode",
+      name: "Bruxos: mostrar tempo no titulo do node (funciona no Node 2.0)",
+      type: "boolean",
+      defaultValue: true,
+      onChange: (v) => { modoTitulo = !!v; if (!v) restauraTitulos(); },
     });
 
     // Fallback p/ Node 2.0: desenha no nivel do canvas (o per-node onDrawForeground

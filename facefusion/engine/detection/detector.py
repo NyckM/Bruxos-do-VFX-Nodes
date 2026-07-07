@@ -57,7 +57,8 @@ class FaceDetector:
                 ):
                     return False
             
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            from ..runtime import resolve_providers
+            providers = resolve_providers()
             self.detector_session = ort.InferenceSession(detector_path, providers=providers)
             self.recognition_session = ort.InferenceSession(recognition_path, providers=providers)
             

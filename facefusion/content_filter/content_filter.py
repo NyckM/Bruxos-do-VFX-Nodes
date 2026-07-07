@@ -145,7 +145,8 @@ class ContentFilter:
             print("[ContentFilter] WARNING: Module integrity check failed!")
             print("[ContentFilter] Content filter may have been tampered with.")
         
-        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        from ..engine.runtime import resolve_providers
+        providers = resolve_providers()
         
         for model_name in MODEL_CONFIGS.keys():
             model_path = os.path.join(self.models_dir, f'{model_name}.onnx')

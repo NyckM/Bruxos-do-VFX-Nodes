@@ -38,7 +38,8 @@ class FaceOccluder:
                     return False
             
             # Create ONNX session
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            from ..runtime import resolve_providers
+            providers = resolve_providers()
             self.model_session = ort.InferenceSession(model_path, providers=providers)
             
             # print(f"[FaceOccluder] Model {self.model_name} loaded, running on: {self.model_session.get_providers()[0]}")

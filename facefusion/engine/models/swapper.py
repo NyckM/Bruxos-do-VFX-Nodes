@@ -47,7 +47,8 @@ class LocalFaceSwapper:
                     return False
             
             # Create ONNX session
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            from ..runtime import resolve_providers
+            providers = resolve_providers()
             self.model_session = ort.InferenceSession(model_path, providers=providers)
             
             # Load model_initializer for inswapper models

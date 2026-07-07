@@ -1,0 +1,29 @@
+# ============================================================================
+# ComfyUI Bruxos do VFX - dependencias
+# ----------------------------------------------------------------------------
+# NOTA sobre onnxruntime-gpu:
+#   NAO liste onnxruntime-gpu aqui com --upgrade. A versao mais nova do PyPI e
+#   build CUDA 13 e quebra o FaceFusion (erro cublasLt64_13.dll -> cai na CPU)
+#   em ambientes CUDA 12.x (torch cu128, padrao do ComfyUI). Use o install.bat,
+#   que crava a build CUDA 12 a partir do feed onnxruntime-cuda-12.
+# ============================================================================
+
+# --- base (face swap, download de modelos, video) ---
+opencv-python
+onnx
+requests
+tqdm
+huggingface_hub
+
+# --- deps LEVES p/ os nodes de tracking Bruxos (trajetoria / export / utils) ---
+#     So pip inofensivo. Os MODELOS PESADOS de tracking (DROID-SLAM, DUSt3R,
+#     CoTracker, SpaTracker, GVHMR...) NAO entram aqui: eles vem do pacote de
+#     tracking separado, com o instalador proprio dele (git clone + checkpoints).
+#     Os nodes Bruxos de tracking apenas "puxam" esses trackers se estiverem
+#     instalados; sem eles, os nodes avisam em portugues em vez de quebrar.
+roma
+kornia
+trimesh
+einops
+scipy
+pyyaml
