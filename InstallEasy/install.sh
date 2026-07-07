@@ -33,6 +33,9 @@ echo
 # ---- 1) dependencias ----
 echo "[1/2] Instalando dependencias (onnxruntime-gpu, opencv, onnx, requests, tqdm, huggingface_hub)..."
 "$PY" -m pip install --upgrade onnxruntime-gpu opencv-python-headless onnx requests tqdm "huggingface_hub[cli]"
+# deps LEVES p/ os nodes de tracking Bruxos (trajetoria/export/utils). Modelos pesados
+# (DROID-SLAM, DUSt3R, CoTracker...) NAO entram aqui: vem do pacote de tracking separado.
+"$PY" -m pip install --upgrade roma kornia trimesh einops scipy pyyaml
 # (opcional) Qwen-VL Caption:
 # "$PY" -m pip install --upgrade transformers accelerate pillow
 

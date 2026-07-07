@@ -36,11 +36,30 @@ echo ComfyUI: "%COMFY_DIR%"
 echo.
 
 REM ---- 1) dependencias ----
-echo [1/2] Instalando dependencias (onnxruntime-gpu, opencv, onnx, requests, tqdm, huggingface_hub)...
-"%PY%" -m pip install --upgrade onnxruntime-gpu opencv-python onnx requests tqdm huggingface_hub
+echo [1/3] Instalando dependencias base (opencv, onnx, requests, tqdm, huggingface_hub)...
+"%PY%" -m pip install --upgrade opencv-python onnx requests tqdm huggingface_hub
 if errorlevel 1 (
-  echo [ERRO] Falha ao instalar dependencias. Veja o log acima.
+  echo [ERRO] Falha ao instalar dependencias base. Veja o log acima.
   pause & exit /b 1
+)
+
+REM ---- onnxruntime-gpu: CRAVAR a build CUDA 12 (casa com torch cu12x do ComfyUI) ----
+REM  NAO usar "--upgrade onnxruntime-gpu" solto: a versao nova e build CUDA 13 e
+REM  quebra o FaceFusion (erro cublasLt64_13.dll -> cai na CPU). Forcamos CUDA 12.
+echo [2/3] Instalando onnxruntime-gpu (build CUDA 12)...
+"%PY%" -m pip uninstall -y onnxruntime onnxruntime-gpu onnxruntime-openvino onnxruntime-directml >nul 2>&1
+"%PY%" -m pip install "onnxruntime-gpu<1.23" --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
+if errorlevel 1 (
+  echo [AVISO] Falha ao instalar onnxruntime-gpu CUDA 12. O face swap pode cair na CPU.
+)
+
+REM ---- deps LEVES p/ os nodes de tracking Bruxos (trajetoria/export/utils) ----
+REM  So pacotes pip inofensivos. Os modelos pesados (DROID-SLAM, DUSt3R, CoTracker...)
+REM  NAO sao instalados aqui: eles vem do pacote de tracking separado (git clone proprio).
+echo [3/3] Instalando deps leves de tracking (roma, kornia, trimesh, einops, scipy, pyyaml)...
+"%PY%" -m pip install --upgrade roma kornia trimesh einops scipy pyyaml
+if errorlevel 1 (
+  echo [AVISO] Falha em alguma dep de tracking. Os utilitarios de tracking podem nao carregar.
 )
 REM  (opcional) Qwen-VL Caption precisa disto; descomente se for usar:
 REM "%PY%" -m pip install --upgrade transformers accelerate pillow
