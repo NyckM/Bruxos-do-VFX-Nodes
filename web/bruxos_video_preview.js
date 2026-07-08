@@ -50,6 +50,27 @@ function ensurePreview(node) {
     hideOnZoom: false,
   });
 
+  // No Node 2.0 o container pai do DOMWidget as vezes fica mais largo que o
+  // node, e o preview vaza pela direita. Este hook forca, a cada desenho, a
+  // largura do wrap a acompanhar a largura REAL do node (menos a margem da
+  // moldura), independente do que o container pai tente impor.
+  const _origDraw = node.onDrawForeground;
+  node.onDrawForeground = function (ctx) {
+    const r = _origDraw ? _origDraw.apply(this, arguments) : undefined;
+    try {
+      const alvo = Math.max(80, (this.size?.[0] || 200) - 26);
+      if (wrap.parentElement) {
+        wrap.parentElement.style.width = alvo + "px";
+        wrap.parentElement.style.maxWidth = alvo + "px";
+        wrap.parentElement.style.overflow = "hidden";
+        wrap.parentElement.style.boxSizing = "border-box";
+      }
+      wrap.style.width = alvo + "px";
+      wrap.style.maxWidth = alvo + "px";
+    } catch (e) {}
+    return r;
+  };
+
   widget.computeSize = function (width) {
     let h = INFO_H;
     if (node._bruxosPrev && node._bruxosPrev.video.style.display !== "none") {
