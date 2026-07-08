@@ -303,8 +303,8 @@ class BruxosLoadVideo:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "VIDEO", "AUDIO", "FLOAT", "INT", "STRING")
-    RETURN_NAMES = ("images", "video", "audio", "fps", "frame_count", "video_info")
+    RETURN_TYPES = ("IMAGE", "VIDEO", "AUDIO", "FLOAT", "INT", "INT", "INT", "STRING")
+    RETURN_NAMES = ("images", "video", "audio", "fps", "frame_count", "width", "height", "video_info")
     FUNCTION = "load"
     CATEGORY = "Bruxos do VFX/Video"
 
@@ -331,7 +331,7 @@ class BruxosLoadVideo:
         info_json = json.dumps(info, ensure_ascii=False)
         result = (images, video_obj, audio,
                   float(out_fps if out_fps > 0 else src_fps),
-                  int(B), info_json)
+                  int(B), int(W), int(H), info_json)
 
         # UI: infos pro node + ponteiro de preview (so quando vem do diretorio input)
         ui = {"bruxos_info": [info_json]}

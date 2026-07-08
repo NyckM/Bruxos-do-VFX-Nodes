@@ -22,7 +22,8 @@ function ensurePreview(node) {
 
   const wrap = document.createElement("div");
   wrap.style.cssText =
-    "width:100%;box-sizing:border-box;display:block;overflow:hidden;";
+    "width:100%;max-width:100%;box-sizing:border-box;display:block;" +
+    "overflow:hidden;contain:layout;padding:0 2px;";
 
   const video = document.createElement("video");
   video.muted = true;
@@ -53,7 +54,8 @@ function ensurePreview(node) {
     let h = INFO_H;
     if (node._bruxosPrev && node._bruxosPrev.video.style.display !== "none") {
       const aspect = node._bruxosMeta && node._bruxosMeta.aspect;
-      const w = (node.size && node.size[0] ? node.size[0] : width) - 20;
+      // -24: margem p/ a moldura do node; evita o preview vazar pela lateral
+      const w = (node.size && node.size[0] ? node.size[0] : width) - 24;
       if (aspect) h += Math.min(MAX_H, Math.max(60, w / aspect)) + 8;
       else h += 160;
     }
@@ -240,6 +242,19 @@ app.registerExtension({
       nodeType.prototype.onNodeCreated = function () {
         const r = onCreated ? onCreated.apply(this, arguments) : undefined;
         hookLoadVideo(this);
+        return r;
+      };
+      // onConfigure roda DEPOIS que o ComfyUI restaura os valores salvos do
+      // workflow. Sem isto, o refreshPreview inicial (em onNodeCreated) pega o
+      // valor velho/vazio do widget 'video' e mostra OUTRO video ao reabrir a
+      // workflow -- so corrigia se o usuario trocasse o seletor na mao.
+      const onConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function () {
+        const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+        // agora os widgets ja tem o valor salvo; re-renderiza no video certo.
+        // 2 disparos: imediato e um com folga (caso o valor chegue 1 tick depois)
+        try { refreshPreview(this); } catch (e) {}
+        setTimeout(() => { try { refreshPreview(this); } catch (e) {} }, 60);
         return r;
       };
       const onExec = nodeType.prototype.onExecuted;
