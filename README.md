@@ -47,7 +47,7 @@ Reinicie o ComfyUI.
 <img width="226" height="557" alt="Bernini Long Condition" src="https://github.com/user-attachments/assets/934fd9b3-087f-47db-aeb2-6ca01967c556" />
 
 **Bernini / Geração**
-- **Bernini Infinity** — renderer principal para vídeos maiores que o limite de 81 frames, sem precisar de um sampler novo. Injeta `context_latents` por chunk (com `tail_memory` opcional) em vez de um único conditioning — aproveita a arquitetura nativa do Bernini/Wan.
+- **Bernini Infinity** — renderer principal para vídeos maiores que o limite de 81 frames, sem precisar de um sampler novo. Injeta `context_latents` por chunk (com `tail_memory` opcional) em vez de um único conditioning — aproveita a arquitetura nativa do Bernini/Wan. Tem **gerenciamento de memória** embutido (limpeza de VRAM entre os passos high/low e entre os blocos de frames, + monitor de RAM/VRAM) para rodar resoluções maiores e vídeos longos sem entupir a GPU — ver [Memória (VRAM/RAM)](#memória-vramram).
 - **Bernini Region Mask** — normaliza máscara colorida (SAM2/SAM3/Scail2Color) em B/W, com invert/grow/blur.
 - **Bernini Long** *(Conditioning / ChunkSelect / VideoMerge / AppendVideoChunk / EmptyVideoChunks / Info)* — helpers de vídeo longo.
 - **FaceStitchUpscale** — cola o rosto upscalado de volta no vídeo usando os `face_bboxes` do Pose and Face Detection.
@@ -66,7 +66,7 @@ Reinicie o ComfyUI.
 - **Config de Upscale** / **Blend de Batches** — super-nodes que substituem os subgraphs de Settings/Blend Frames.
 
 **Utilidades**
-- Crescer+Borrar Máscara, Máscara em Blocos, **Desenhar Máscara na Imagem** (visualização — pinta a máscara existente sobre a imagem, não seleciona/clica), **Face Crop Expand**, Nitidez Inteligente, Texto/Mostrar Texto, Seed, Carregar Imagens da Pasta, Info do Vídeo, Loader Tudo-em-1 Wan, Qwen-VL Caption, Prompt Guide (presets oficiais Bernini).
+- Crescer+Borrar Máscara, Máscara em Blocos, **Desenhar Máscara na Imagem** (visualização — pinta a máscara existente sobre a imagem, não seleciona/clica), **Face Crop Expand**, Nitidez Inteligente, Texto/Mostrar Texto, Seed, Carregar Imagens da Pasta, Info do Vídeo, Loader Tudo-em-1 Wan, Qwen-VL Caption, Prompt Guide (presets oficiais Bernini), **Cronômetro / Relatório de Tempo** (cronometra trechos do fluxo no backend, funciona em qualquer render mode).
 
 ---
 
@@ -116,6 +116,28 @@ Load Video ─────────────→ target_images ─┴→ Fa
 
 ---
 
+## Memória (VRAM/RAM)
+
+Para resoluções maiores e vídeos longos, o **Bernini Infinity** limpa a memória em dois pontos críticos: **entre o high pass e o low pass** (os dois modelos não precisam ficar residentes na VRAM ao mesmo tempo) e **entre cada bloco de frames** (no modo `sequential` e a cada janela). Isso previne o acúmulo (memory leak) que enche a RAM/VRAM ao longo de renders grandes. Dois widgets controlam o comportamento:
+
+**`limpar_vram`**
+
+| Valor | O que faz | Quando usar |
+|---|---|---|
+| `off` | Sem limpeza entre os passos (comportamento legado). A limpeza essencial por bloco continua acontecendo. | Só se quiser o comportamento antigo. |
+| `leve` *(padrão)* | `gc.collect()` + esvazia o cache da VRAM (`soft_empty_cache` + `empty_cache` + `ipc_collect`) entre high/low e entre blocos. Barato e seguro. | Uso geral. Deixe aqui. |
+| `agressivo` | Além do acima, **descarrega os modelos** da VRAM entre os passos (high e low nunca ficam juntos) → menor pico de VRAM. Recarrega o modelo a cada troca (mais lento). | Só quando estourar VRAM em resolução alta. |
+
+**`monitor_memoria`** (liga/desliga) — imprime no console o uso de **RAM e VRAM** em tempo real (no início, entre high/low, por bloco e no fim), pra você ver exatamente onde a memória enche. Precisa de CUDA (para a VRAM) e do `psutil` (para a RAM); o que faltar aparece em branco, sem quebrar. Exemplo de linha:
+
+```text
+[Bernini Infinity][mem] pos-high: VRAM 19.00/24.00GB (alloc 12.00 reserv 15.00) | RAM 58.0/98.0GB
+```
+
+> Portátil por padrão: tudo é tolerante a ambiente (sem CUDA, sem `psutil`, versões antigas do ComfyUI) e **não depende de nenhuma flag de launch**. Os dois widgets são opcionais — workflows salvos antes desta versão continuam válidos (carregam com o padrão `leve`). Como os widgets novos mudam os tipos do node, se o Bernini Infinity já estiver no grafo, **remova e readicione** (ou apenas religue os fios) para eles aparecerem.
+
+---
+
 ## Changelog (principais marcos)
 
 - **0.2** — correção automática de frames 4n+1 (padding espelhado + corte de volta); `mask_mode` (off/inpaint/bbox), `mask_grow`, `mask_blur`.
@@ -125,6 +147,7 @@ Load Video ─────────────→ target_images ─┴→ Fa
 - **0.10** — Editor de Pontos SAM3 (seleção verde/negação roxa) para tracking mais estável.
 - **0.11** — `bbox_compose` (`silhouette`/`rectangle`): o modo `rectangle` cola o retângulo do bbox com feather (`mask_blur`) e elimina a "linha" de contorno na composição `bbox`; a máscara passa a acompanhar o `resize_mode` (`stretch`/`crop`) da fonte.
 - **0.12** — troca de rosto local (ONNX) **incluída no pacote** (pasta `facefusion/`): nodes **FaceFusion Swap** e **Detectar Rostos**, com saída de máscara integrada ao Bernini. Reconstrução de [huygiatrng/Facefusion_comfyui](https://github.com/huygiatrng/Facefusion_comfyui) em modo 100% local.
+- **0.13** — gerenciamento de memória no **Bernini Infinity**: limpeza de VRAM **entre o high pass e o low pass** e **entre os blocos de frames** (para resoluções maiores / vídeos longos), com prevenção de acúmulo (leak) via garbage collection. Widget **`limpar_vram`** (`off` / `leve` / `agressivo`) e widget **`monitor_memoria`** (relatório de RAM/VRAM em tempo real no console). Portátil (tolerante a ausência de CUDA/`psutil`) e compatível com workflows antigos. Ver [Memória (VRAM/RAM)](#memória-vramram).
 
 ---
 
