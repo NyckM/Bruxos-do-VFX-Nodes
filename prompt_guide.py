@@ -44,6 +44,12 @@ _GEN_NEG = (
 )
 
 
+# Base comum das 22 tarefas de edicao do Bernini-Bench (5 dimensoes). Cada
+# entrada = system prompt de edicao + diretriz curta da categoria. Editaveis
+# no node; sao pontos de partida alinhados a taxonomia do paper.
+_BERN_EDIT = "You are a helpful assistant specialized in video editing. "
+
+
 PRESETS = {
     # =====================================================================
     "Bernini": {
@@ -61,6 +67,39 @@ PRESETS = {
             "Ads Insertion": "You are a helpful assistant specialized in ads insertion.",
             "Video Reference Control": "You are a helpful assistant for editing. You may need to adjust the subject's action or position.",
             "Motion / Style Edit": "You are a helpful assistant for editing. You might need to adjust the video's style, lighting, colors, textures, and the subject's pose or action.",
+
+            # ---- Bernini-Bench: 22 tarefas de edicao (5 dimensoes) ----
+            # Subject Editing (6)
+            "Subject: Remove": _BERN_EDIT + "Task: object removal. Remove the specified subject/object and reconstruct a plausible background where it was; keep everything else unchanged and temporally stable. Prefer a short, specific instruction (name the object and its position).",
+            "Subject: Add": _BERN_EDIT + "Task: object addition. Add a new subject/object; describe its appearance, position in the frame, scale, and how it interacts with the existing scene and lighting; keep the rest of the video unchanged.",
+            "Subject: Replace": _BERN_EDIT + "Task: subject replacement. Describe BOTH what is being replaced (and its location) AND the new subject; keep a similar scale and region, and preserve the surrounding content.",
+            "Subject: Pose/Action": _BERN_EDIT + "Task: pose/action change (e.g., sitting to standing, walking to running) while preserving the subject's identity and clothing and the scene; keep the motion natural and temporally coherent.",
+            "Subject: Attribute": _BERN_EDIT + "Task: attribute change (color, clothing, material, hairstyle) on the target subject while preserving its identity and everything else; keep the change consistent across all frames.",
+            "Subject: Expression": _BERN_EDIT + "Task: facial expression change (e.g., neutral to smiling) while strictly preserving identity, pose, and background; keep it subtle and temporally smooth.",
+
+            # Scene & Environment (4)
+            "Scene: Background": _BERN_EDIT + "Task: background/scene change behind the subject while keeping the subject unchanged and correctly composited; match lighting, perspective, and shadows.",
+            "Scene: Atmosphere": _BERN_EDIT + "Task: atmosphere/mood change (e.g., add fog, dust, haze, god rays) while preserving subjects and layout; keep it consistent across frames.",
+            "Scene: Weather": _BERN_EDIT + "Task: weather change (rain, snow, sunshine) applied consistently across the whole video; adjust lighting and reflections accordingly while preserving subjects and scene structure.",
+            "Scene: Time/Season": _BERN_EDIT + "Task: time-of-day or season change (day to night, summer to winter); adjust lighting, color temperature, and shadows consistently while preserving scene geometry and subjects.",
+
+            # Visual & Style (4)
+            "Style: Material": _BERN_EDIT + "Task: material/texture change of a specified surface or object (e.g., wood to metal) while keeping its shape and the rest of the scene unchanged.",
+            "Style: Style Transfer": _BERN_EDIT + "Task: style transfer. Convert the whole video into a target artistic style, applied consistently across all frames while preserving structure and motion. Use the template: 'Convert the video into a <STYLE> style.' (e.g. Watercolor, Van Gogh, Claymation, Ghibli, 3D animation).",
+            "Style: Color": _BERN_EDIT + "Task: color adjustment/grade (white balance, saturation, tint) applied consistently across the whole video while preserving content and detail.",
+            "Style: Filter": _BERN_EDIT + "Task: visual filter/effect (e.g., vintage, black-and-white, film grain, bloom) applied uniformly across the video while preserving content.",
+
+            # Camera & Motion (4)
+            "Camera: Motion": _BERN_EDIT + "Task: change or add camera motion (pan, zoom, dolly, orbit) while keeping subject identity and scene consistent and sharply tracked throughout.",
+            "Camera: Position": _BERN_EDIT + "Task: reposition a subject/object within the frame (e.g., move the distant boat closer into the midground) while preserving its identity and matching perspective, scale, and occlusion.",
+            "Camera: Viewpoint": _BERN_EDIT + "Task: viewpoint/perspective change of the scene while preserving subject identity and scene content; keep the geometry plausible.",
+            "Camera: Focus": _BERN_EDIT + "Task: focus control (rack focus / depth of field). Shift the focus to the specified subject, keeping it sharp and consistently tracked while the rest is appropriately defocused.",
+
+            # Reasoning (4)
+            "Reasoning: Causal": _BERN_EDIT + "Task: causal reasoning edit. Infer the physically plausible consequence implied by the instruction (e.g., prolonged heavy rain extinguishes a fire) and render the resulting state and its evolution over time.",
+            "Reasoning: Temporal": _BERN_EDIT + "Task: temporal reasoning edit. Show how the scene evolves over time as implied by the instruction (before to after, progression), keeping it physically consistent.",
+            "Reasoning: Spatial": _BERN_EDIT + "Task: spatial reasoning edit. Perform layout/position changes that require understanding 3D scene relationships (occlusion, depth, relative placement) while keeping content consistent.",
+            "Reasoning: Interaction": _BERN_EDIT + "Task: interaction edit. Introduce or modify a natural interaction between subjects (e.g., a new person interacting with the existing ones) while keeping identities and the scene coherent.",
         },
         "negatives": {"Official Bernini": _GEN_NEG, "None": ""},
         "default_negative": "Official Bernini",

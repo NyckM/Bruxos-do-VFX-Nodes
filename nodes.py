@@ -1,4 +1,5 @@
 import copy
+import gc
 import math
 
 import torch
@@ -7,6 +8,96 @@ import comfy.model_management
 import comfy.samplers
 import comfy.utils
 from comfy_extras.nodes_custom_sampler import BasicScheduler, KSamplerSelect, SamplerCustom, SplitSigmas
+
+# ---------------------------------------------------------------------------
+# Gerenciamento de memoria (portavel): limpeza de VRAM/RAM entre passos e
+# entre blocos, prevencao de vazamento (gc) e monitoramento em tempo real.
+# Tudo em try/except -> funciona em CPU, sem CUDA, sem psutil e em versoes
+# antigas do ComfyUI. Nao depende de nenhuma flag de launch.
+# ---------------------------------------------------------------------------
+try:
+    import psutil as _psutil
+except Exception:
+    _psutil = None
+
+
+def _mem_gb(n):
+    try:
+        return float(n) / (1024.0 ** 3)
+    except Exception:
+        return 0.0
+
+
+def _mem_snapshot():
+    """Foto atual de RAM (sistema) e VRAM (GPU corrente). Campos ausentes se
+    a fonte nao estiver disponivel."""
+    snap = {}
+    if _psutil is not None:
+        try:
+            vm = _psutil.virtual_memory()
+            snap["ram_used"] = _mem_gb(vm.total - vm.available)
+            snap["ram_total"] = _mem_gb(vm.total)
+        except Exception:
+            pass
+    try:
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info()
+            snap["vram_free"] = _mem_gb(free)
+            snap["vram_total"] = _mem_gb(total)
+            snap["vram_alloc"] = _mem_gb(torch.cuda.memory_allocated())
+            snap["vram_reserved"] = _mem_gb(torch.cuda.memory_reserved())
+    except Exception:
+        pass
+    return snap
+
+
+def _mem_report(tag):
+    """Imprime uma linha compacta de uso de memoria (VRAM + RAM)."""
+    s = _mem_snapshot()
+    parts = []
+    if "vram_total" in s:
+        used = s["vram_total"] - s.get("vram_free", s["vram_total"])
+        parts.append(
+            f"VRAM {used:.2f}/{s['vram_total']:.2f}GB "
+            f"(alloc {s.get('vram_alloc', 0.0):.2f} reserv {s.get('vram_reserved', 0.0):.2f})"
+        )
+    if "ram_total" in s:
+        parts.append(f"RAM {s['ram_used']:.1f}/{s['ram_total']:.1f}GB")
+    if not parts:
+        parts.append("sem dados (cuda/psutil indisponivel)")
+    print(f"[Bernini Infinity][mem] {tag}: " + " | ".join(parts), flush=True)
+
+
+def _mem_cleanup(level="leve"):
+    """Limpeza de memoria. Niveis:
+      off        -> nao faz nada (comportamento legado).
+      leve       -> gc.collect() + esvazia cache de VRAM (soft_empty_cache +
+                    torch empty_cache/ipc_collect). Barato e seguro.
+      agressivo  -> alem do acima, DESCARREGA os modelos da VRAM
+                    (unload_all_models). Garante que high e low nunca fiquem
+                    residentes juntos -> menor pico de VRAM (bom p/ resolucoes
+                    maiores), ao custo de recarregar o modelo (mais lento)."""
+    if level == "off":
+        return
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    if level == "agressivo":
+        try:
+            comfy.model_management.unload_all_models()
+        except Exception:
+            pass
+    try:
+        comfy.model_management.soft_empty_cache()
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
 
 
 def _clone_conditioning_set_values(conditioning, values):
@@ -763,6 +854,11 @@ class BerniniInfinity:
                 "resize_mode": (["stretch", "crop"], {"default": "stretch", "tooltip": "Encaixe quando a proporcao do video difere de width/height. stretch = estica pro tamanho exato, SEM cortar (pode distorcer um pouco). crop = corta as bordas mantendo a proporcao."}),
             },
             "optional": {
+                "limpar_vram": (["off", "leve", "agressivo"], {"default": "leve", "tooltip": "Limpeza de VRAM entre os passos high/low e entre os blocos de frames, pra rodar resolucoes maiores e videos longos sem entupir a GPU. off = nada (legado). leve = gc + esvazia cache da VRAM (barato, recomendado). agressivo = tambem DESCARREGA os modelos entre os passos (high e low nunca ficam juntos na VRAM = menor pico), porem recarrega o modelo a cada troca (mais lento). Use agressivo so se estourar VRAM em resolucao alta."}),
+                "monitor_memoria": ("BOOLEAN", {"default": False, "tooltip": "Imprime no console o uso de RAM e VRAM em tempo real (inicio, entre high/low, por bloco e no fim). Use pra diagnosticar onde a memoria enche. Precisa de CUDA (VRAM) e psutil (RAM); o que faltar aparece em branco."}),
+                "guidance_mode": (["turbo_auto", "full_multi"], {"default": "turbo_auto", "tooltip": "turbo_auto = usa CFG nativo em modelos distill/LightX2V e evita 4 forwards por step. full_multi = guidance independente por stream (video/ref/texto), podendo custar ate 4 passes por step."}),
+                "w_vid": ("FLOAT", {"default": 1.25, "min": 0.0, "max": 30.0, "step": 0.05, "tooltip": "[guidance_mode=multi] Peso da adesao ao VIDEO-fonte. Maior = mais fiel ao original; menor = mais liberdade pra editar. Paper: 1.25 (V2V/RV2V)."}),
+                "w_img": ("FLOAT", {"default": 1.25, "min": 0.0, "max": 30.0, "step": 0.05, "tooltip": "[guidance_mode=multi] Peso das IMAGENS/refs. Em RV2V pese mais (paper: 3.0). So tem efeito se houver reference_images/reference_video."}),
                 "region_mask": ("MASK,IMAGE", {"tooltip": "Mascara da regiao a gerar (branco/colorido = gera, preto = mantem a fonte). Aceita MASK ou IMAGE colorida -- pode ligar direto o pose_video_mask/reference_image_mask do 'Create SCAIL-2 Colored Mask'. Use com mask_mode = inpaint ou bbox."}),
                 "reference_video": ("IMAGE", {"tooltip": "Video de referencia opcional (ex.: clean plate / identidade). Vira latente de contexto extra pra guiar a geracao. Nao precisa ter o mesmo tamanho do source."}),
                 "reference_images.reference_image_0": ("IMAGE", {"tooltip": "Imagem de referencia 0 (ex.: rosto/objeto a preservar). Vira contexto extra. Pode deixar vazio."}),
@@ -825,10 +921,29 @@ class BerniniInfinity:
         mask_pad=16,
         bbox_compose="silhouette",
         resize_mode="stretch",
+        limpar_vram="leve",
+        monitor_memoria=False,
+        guidance_mode="off",
+        w_vid=1.25,
+        w_img=1.25,
         region_mask=None,
         reference_video=None,
         **kwargs,
     ):
+        # guidance: turbo_auto evita o multi-guider de ate 4 forwards;
+        # full_multi preserva a guidance independente por stream.
+        self._g_mode = "multi" if guidance_mode == "full_multi" else "off"
+        self._g_wvid = float(w_vid)
+        self._g_wimg = float(w_img)
+        if monitor_memoria:
+            _mem_report("inicio")
+        if self._g_mode == "multi":
+            print(f"[Bernini Infinity] guidance_mode=full_multi (w_txt=cfg, w_vid={w_vid}, w_img={w_img}) "
+                  f"-> ate 4 passes/step, mais lento. Fallback p/ CFG se o formato do cond nao bater.",
+                  flush=True)
+        else:
+            print("[Bernini Infinity] guidance_mode=turbo_auto -> CFG nativo/context_latents; "
+                  "multi-guidance de 4 forwards desativado.", flush=True)
         frame_count = int(source_video.shape[0])
         target = frame_count if int(max_frames) <= 0 else min(frame_count, int(max_frames))
         chunk_size = int(chunk_size)
@@ -856,6 +971,7 @@ class BerniniInfinity:
                 mask_grow=mask_grow, mask_blur=mask_blur, mask_pad=mask_pad,
                 bbox_compose=bbox_compose,
                 resize_mode=resize_mode,
+                limpar_vram=limpar_vram, monitor_memoria=monitor_memoria,
             )
         return self._render_sequential(
             positive, negative, high_model, low_model, vae, source_video,
@@ -866,6 +982,7 @@ class BerniniInfinity:
             region_mask=region_mask, mask_mode=mask_mode,
             mask_grow=mask_grow, mask_blur=mask_blur,
             resize_mode=resize_mode,
+            limpar_vram=limpar_vram, monitor_memoria=monitor_memoria,
         )
 
     # ------------------------------------------------------------------
@@ -874,6 +991,81 @@ class BerniniInfinity:
     #     + (tail_memory: frames JA EDITADOS do chunk anterior).
     #   - juncao por CROSSFADE de latente (sem corte seco).
     # ------------------------------------------------------------------
+    def _sample_pass(
+        self,
+        model,
+        add_noise,
+        seed,
+        cfg,
+        positive,
+        negative,
+        sampler,
+        sigmas,
+        latent,
+    ):
+        """
+        Sampling otimizado para Bernini/Wan.
+
+        Modelos distill / LightX2V com CFG ~= 1 nao devem usar
+        multi-guidance de 4 forwards. O conditioning do Bernini
+        ja contem context_latents com video e referencias.
+        """
+        guidance_mode = getattr(self, "_g_mode", "off")
+
+        # FAST PATH: CFG baixo / modelos destilados.
+        if guidance_mode == "multi" and float(cfg) <= 1.5:
+            if not getattr(self, "_fast_guidance_warned", False):
+                self._fast_guidance_warned = True
+                print(
+                    "[Bernini Infinity][guidance] CFG <= 1.5 detectado. "
+                    "Multi-guidance desativado automaticamente para modelo turbo/distill. "
+                    "Usando conditioning nativo com context_latents.",
+                    flush=True,
+                )
+
+            return SamplerCustom.execute(
+                model,
+                add_noise,
+                seed,
+                cfg,
+                positive,
+                negative,
+                sampler,
+                sigmas,
+                latent,
+            ).args[0]
+
+        # FULL MULTI GUIDANCE
+        if guidance_mode == "multi":
+            out = _bx_multi_sample(
+                model,
+                add_noise,
+                seed,
+                cfg,
+                positive,
+                negative,
+                sampler,
+                sigmas,
+                latent,
+                getattr(self, "_g_wvid", 1.25),
+                getattr(self, "_g_wimg", 1.25),
+            )
+            if out is not None:
+                return out
+
+        # CFG NORMAL
+        return SamplerCustom.execute(
+            model,
+            add_noise,
+            seed,
+            cfg,
+            positive,
+            negative,
+            sampler,
+            sigmas,
+            latent,
+        ).args[0]
+
     def _render_sequential(
         self, positive, negative, high_model, low_model, vae, source_video,
         width, height, seed, sampler, high_sigmas, low_sigmas, cfg,
@@ -882,6 +1074,7 @@ class BerniniInfinity:
         reference_video, reference_images,
         region_mask=None, mask_mode="off", mask_grow=0, mask_blur=0,
         resize_mode="stretch",
+        limpar_vram="leve", monitor_memoria=False,
     ):
         step = max(1, chunk_size - overlap)
         lat_drop = ((overlap - 1) // 4) + 1 if overlap > 0 else 0
@@ -950,12 +1143,17 @@ class BerniniInfinity:
                 flush=True,
             )
 
-            high = SamplerCustom.execute(
+            high = self._sample_pass(
                 high_model, True, chunk_seed, float(cfg), pos, neg, sampler, high_sigmas, latent
-            ).args[0]
-            low = SamplerCustom.execute(
+            )
+            # limpa a VRAM entre o high pass e o low pass (os dois modelos
+            # nunca precisam ficar residentes juntos quando 'agressivo').
+            if monitor_memoria:
+                _mem_report(f"chunk {chunk_index + 1} pos-high")
+            _mem_cleanup(limpar_vram)
+            low = self._sample_pass(
                 low_model, False, 0, float(cfg), pos, neg, sampler, low_sigmas, high
-            ).args[0]
+            )
             chunk_latent = low["samples"]
             imgs = _decode_video(vae, chunk_latent, bool(decode_tiled))
             # corta o padding de alinhamento: volta ao tamanho real do chunk
@@ -991,7 +1189,9 @@ class BerniniInfinity:
                 stitched_latents = _merge_latent_overlap(stitched_latents, full_lat, lat_drop)
 
             del high, low, latent, chunk_latent, imgs, pos, neg, context_latents
-            comfy.model_management.soft_empty_cache()
+            _mem_cleanup(limpar_vram if limpar_vram != "off" else "leve")
+            if monitor_memoria:
+                _mem_report(f"chunk {chunk_index + 1} fim")
             chunk_index += 1
             if end >= target:
                 break
@@ -1000,6 +1200,9 @@ class BerniniInfinity:
             stitched_imgs = stitched_imgs[:target]
             stitched_latents = stitched_latents[:, :, :(((target - 1) // 4) + 1)]
 
+        _mem_cleanup(limpar_vram)
+        if monitor_memoria:
+            _mem_report("fim")
         print(f"[Bernini Infinity][seq] done: {int(stitched_imgs.shape[0])} frames, {chunk_index} chunk(s).", flush=True)
         return (stitched_imgs.cpu(), {"samples": stitched_latents.cpu()}, int(stitched_imgs.shape[0]))
 
@@ -1014,6 +1217,7 @@ class BerniniInfinity:
         region_mask=None, mask_mode="off", mask_grow=0, mask_blur=0, mask_pad=16,
         bbox_compose="silhouette",
         resize_mode="stretch",
+        limpar_vram="leve", monitor_memoria=False,
     ):
         target = int(target)
         # --- alinhamento temporal: trabalhamos no proximo 4n+1 e cortamos depois ---
@@ -1053,6 +1257,7 @@ class BerniniInfinity:
                 decode_tiled, decode_chunk, ref_max_size,
                 reference_video, reference_images, int(mask_pad),
                 bbox_compose=bbox_compose, feather=int(mask_blur),
+                limpar_vram=limpar_vram, monitor_memoria=monitor_memoria,
             )
         if use_mask and mask_mode == "bbox" and use_ctx:
             print("[Bernini Infinity][ctx] bbox indisponivel com janelas; "
@@ -1096,8 +1301,12 @@ class BerniniInfinity:
             hi.set_model_unet_function_wrapper(wrapper)
             lo.set_model_unet_function_wrapper(wrapper)
 
-        high = SamplerCustom.execute(hi, True, int(seed), float(cfg), pos, neg, sampler, high_sigmas, latent).args[0]
-        low = SamplerCustom.execute(lo, False, 0, float(cfg), pos, neg, sampler, low_sigmas, high).args[0]
+        high = self._sample_pass(hi, True, int(seed), float(cfg), pos, neg, sampler, high_sigmas, latent)
+        # limpeza de VRAM entre high pass e low pass
+        if monitor_memoria:
+            _mem_report("pos-high")
+        _mem_cleanup(limpar_vram)
+        low = self._sample_pass(lo, False, 0, float(cfg), pos, neg, sampler, low_sigmas, high)
         result_latent = low["samples"]
 
         if int(decode_chunk) > 0:
@@ -1131,7 +1340,9 @@ class BerniniInfinity:
             result_imgs = result_imgs[:target]
             result_latent = result_latent[:, :, :_lat_len(target)]
 
-        comfy.model_management.soft_empty_cache()
+        _mem_cleanup(limpar_vram if limpar_vram != "off" else "leve")
+        if monitor_memoria:
+            _mem_report("fim")
         print(f"[Bernini Infinity][ctx] done: {int(result_imgs.shape[0])} frames "
               f"(alvo do usuario={target}).", flush=True)
         return (result_imgs.cpu(), {"samples": result_latent.cpu()}, int(result_imgs.shape[0]))
@@ -1148,6 +1359,7 @@ class BerniniInfinity:
         decode_tiled, decode_chunk, ref_max_size,
         reference_video, reference_images, mask_pad,
         bbox_compose="silhouette", feather=6,
+        limpar_vram="leve", monitor_memoria=False,
     ):
         x0, y0, x1, y1 = _mask_bbox(mask_full, int(mask_pad), 16, int(width), int(height))
         cw, ch = x1 - x0, y1 - y0
@@ -1175,12 +1387,16 @@ class BerniniInfinity:
 
         latent = {"samples": _make_empty_latent(int(aligned), cw, ch, 1)}
 
-        high = SamplerCustom.execute(
+        high = self._sample_pass(
             high_model.clone(), True, int(seed), float(cfg), pos, neg, sampler, high_sigmas, latent
-        ).args[0]
-        low = SamplerCustom.execute(
+        )
+        # limpeza de VRAM entre high pass e low pass
+        if monitor_memoria:
+            _mem_report("bbox pos-high")
+        _mem_cleanup(limpar_vram)
+        low = self._sample_pass(
             low_model.clone(), False, 0, float(cfg), pos, neg, sampler, low_sigmas, high
-        ).args[0]
+        )
         crop_latent = low["samples"]
 
         if int(decode_chunk) > 0:
@@ -1205,7 +1421,9 @@ class BerniniInfinity:
 
         if out.shape[0] > target:
             out = out[:target]
-        comfy.model_management.soft_empty_cache()
+        _mem_cleanup(limpar_vram if limpar_vram != "off" else "leve")
+        if monitor_memoria:
+            _mem_report("fim")
         print(f"[Bernini Infinity][bbox] done: {int(out.shape[0])} frames "
               f"(alvo do usuario={target}).", flush=True)
         return (out, {"samples": crop_latent.cpu()}, int(out.shape[0]))
@@ -1836,13 +2054,218 @@ class BruxosQwenVLCaption:
         return (out_text,)
 
 
+# -------------------------------------------------------------------------
+# Bernini Prompt Enhancer (self-text Chain-of-Thought) — via Qwen-VL local
+# -------------------------------------------------------------------------
+# Implementa o "self-text reasoning" do paper do Bernini (secao 3.6 / Tabela
+# 10): reescreve a instrucao crua do usuario numa instrucao de edicao
+# DETALHADA e ESTRUTURADA, opcionalmente ATERRADA no video-fonte (o modelo
+# olha alguns keyframes). No paper isso sobe todas as metricas (+0.2 a +0.4).
+# Difere do Qwen-VL Caption: nao descreve o video -> reescreve o COMANDO.
+# Reaproveita o mesmo loader/cache do Qwen (_bx_qwen_load), sem 2o download.
+# Saida 'enhanced_prompt' (STRING) e drop-in no lugar do seu prompt de texto.
+
+_BX_BERNINI_ENH_SYSTEM = (
+    "You are a prompt engineer for the Bernini/Wan video generator and editor. "
+    "Rewrite the user's request into ONE detailed, structured and semantically "
+    "enriched instruction that the model can follow precisely.\n"
+    "Rules:\n"
+    "- Preserve the user's original intent EXACTLY. Never add edits they did not ask for.\n"
+    "- Name the target region/object and the operation clearly.\n"
+    "- State what must stay UNCHANGED for consistency (identity, background, lighting) "
+    "and require temporal coherence across all frames.\n"
+    "- Be concrete and visual (materials, lighting, motion, camera), not abstract.\n"
+    "- If source frames are provided, ground the description in what you actually see.\n"
+    "Output ONLY the rewritten instruction as plain text: no preamble, no quotes, "
+    "no explanations, no markdown."
+)
+
+# Direcionamento por tipo de tarefa (taxonomia do Bernini-Bench, 5 dimensoes).
+# Cada opcao injeta uma diretriz curta no system prompt.
+_BX_BERNINI_TASK_HINTS = {
+    "auto": "",
+    "remover": ("REMOVAL edit. Keep the rewritten instruction SHORT and unambiguous "
+                "(name the object + position). Do NOT over-describe -- long removal prompts drift and fail."),
+    "adicionar": ("ADD edit. Describe the new element in detail (appearance, position in frame, "
+                  "scale, interaction with the scene and lighting)."),
+    "trocar_substituir": ("REPLACE edit. Describe BOTH what is being replaced and its location, AND the new "
+                          "subject. Keep a similar scale/region to the original."),
+    "estilo_visual": ("STYLE / visual edit. State the target style precisely and require it to be applied "
+                      "CONSISTENTLY across the whole video (color, material, texture)."),
+    "camera_movimento": ("CAMERA / MOTION edit. Describe the camera or motion change while keeping subject "
+                         "identity, scene layout and background consistent and sharply tracked."),
+    "raciocinio_causal": ("REASONING / causal edit. Infer the physically plausible consequence implied by the "
+                          "instruction and describe the resulting state and how it evolves over time."),
+    "gerar_T2V": ("Text-to-video GENERATION (no source). Produce a vivid, concrete scene: subjects, wardrobe, "
+                  "environment, lighting, camera and motion."),
+    "sujeito_S2V": ("Subject-to-video generation. Preserve the identity/appearance of the given subject while "
+                    "describing the scene, action and camera."),
+}
+_BX_BERNINI_TASKS = list(_BX_BERNINI_TASK_HINTS.keys())
+
+
+class BruxosBerniniPromptEnhancer:
+    """Prompt Enhancer (self-text CoT) do Bernini via Qwen-VL local.
+    Reescreve a instrucao do usuario numa versao estruturada e detalhada,
+    opcionalmente aterrada no video-fonte. Saida drop-in pro seu encoder."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "instruction": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "Sua instrucao crua (ex.: 'remova o carro', 'troque o ceu por por-do-sol'). O node reescreve numa versao detalhada e estruturada."}),
+                "model_name": (_BX_QWEN_MODELS, {"default": _BX_QWEN_MODELS[0],
+                    "tooltip": "Qual Qwen-VL usar (3B leve; 7B mais forte). Mesmo modelo/cache do Qwen-VL Caption -- se ja carregou la, reusa aqui."}),
+                "task": (_BX_BERNINI_TASKS, {"default": "auto",
+                    "tooltip": "Tipo de edicao (taxonomia do Bernini-Bench). Ajusta como a instrucao e reescrita. 'remover' forca instrucao curta; 'estilo' pede consistencia no video todo; etc."}),
+            },
+            "optional": {
+                "source_video": ("IMAGE", {"tooltip": "OPCIONAL: frames do video-fonte pra ATERRAR a reescrita (o modelo olha alguns keyframes). Sem isso, a reescrita e so por texto."}),
+                "num_keyframes": ("INT", {"default": 4, "min": 1, "max": 16, "step": 1,
+                    "tooltip": "Quantos keyframes amostrar do source_video pra o modelo olhar. Poucos ja bastam pra aterrar."}),
+                "extra_rules": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "Regras extras suas (ex.: 'manter o grao de filme', 'nao mexer no rosto'). Vao pro reescritor."}),
+                "verbose_reasoning": ("BOOLEAN", {"default": False,
+                    "tooltip": "Se ligado, o modelo raciocina antes (Chain-of-Thought) e a saida 'reasoning' traz esse raciocinio; 'enhanced_prompt' continua limpo."}),
+                "system_prompt": ("STRING", {"multiline": True, "default": _BX_BERNINI_ENH_SYSTEM,
+                    "tooltip": "As regras do reescritor (editavel). Se apagar, usa o padrao."}),
+                "max_new_tokens": ("INT", {"default": 256, "min": 16, "max": 2048,
+                    "tooltip": "Tamanho maximo do texto reescrito."}),
+                "dtype": (["fp16", "bf16", "fp32"], {"default": "fp16",
+                    "tooltip": "Precisao do modelo. fp16 economiza VRAM; bf16 se a GPU suportar."}),
+                "device": (["auto", "cuda", "cpu"], {"default": "auto",
+                    "tooltip": "Onde rodar. auto escolhe GPU se houver."}),
+                "keep_loaded": ("BOOLEAN", {"default": True,
+                    "tooltip": "Mantem o Qwen na memoria entre execucoes (mais rapido, usa VRAM)."}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
+                    "tooltip": "Semente da geracao de texto (0 = livre)."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("enhanced_prompt", "reasoning")
+    OUTPUT_TOOLTIPS = (
+        "A instrucao reescrita (detalhada/estruturada). Ligue no seu encoder de texto no lugar do prompt cru.",
+        "O raciocinio (Chain-of-Thought), so quando verbose_reasoning=ON; senao vazio.",
+    )
+    FUNCTION = "run"
+    CATEGORY = "Bruxos do VFX/Prompt"
+    DESCRIPTION = (
+        "Prompt Enhancer (self-text CoT) do Bernini via Qwen-VL local. Reescreve sua instrucao "
+        "crua numa versao detalhada e estruturada -- opcionalmente aterrada no video-fonte -- "
+        "seguindo o 'self-text reasoning' do paper (sobe as metricas de edicao). 100% local, "
+        "reusa o mesmo Qwen do Caption. Saida drop-in pro seu encoder de texto."
+    )
+
+    def _sample_frames(self, images, num_keyframes):
+        n = int(images.shape[0])
+        if n <= 1:
+            return [images[0]]
+        k = max(1, min(int(num_keyframes), n))
+        if k == 1:
+            return [images[n // 2]]
+        step = (n - 1) / float(k - 1)
+        idxs = sorted({int(round(i * step)) for i in range(k)})
+        return [images[i] for i in idxs]
+
+    def run(self, instruction, model_name, task,
+            source_video=None, num_keyframes=4, extra_rules="",
+            verbose_reasoning=False, system_prompt=_BX_BERNINI_ENH_SYSTEM,
+            max_new_tokens=256, dtype="fp16", device="auto",
+            keep_loaded=True, seed=0):
+        user_instr = (instruction or "").strip()
+        if not user_instr:
+            return ("", "")
+
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # monta o system prompt: base + diretriz da tarefa + regras extras + modo verbose
+        sys_text = (system_prompt or _BX_BERNINI_ENH_SYSTEM).strip()
+        hint = _BX_BERNINI_TASK_HINTS.get(task, "")
+        if hint:
+            sys_text += "\nTask type: " + hint
+        if (extra_rules or "").strip():
+            sys_text += "\nAdditional user rules (must respect): " + extra_rules.strip()
+        if verbose_reasoning:
+            sys_text += ("\nFirst reason step by step after a line 'REASONING:'. "
+                         "Then output the final instruction after a line 'PROMPT:'.")
+
+        model, processor = _bx_qwen_load(model_name, dtype, device)
+
+        # frames opcionais pra aterrar a reescrita
+        pil_frames = []
+        if source_video is not None:
+            try:
+                pil_frames = [_bx_tensor_to_pil(f) for f in self._sample_frames(source_video, num_keyframes)]
+            except Exception:
+                pil_frames = []
+
+        content = [{"type": "image", "image": img} for img in pil_frames]
+        content.append({"type": "text", "text":
+                        f"{sys_text}\n\nUser request:\n{user_instr}\n\nRewritten instruction:"})
+        messages = [{"role": "user", "content": content}]
+
+        imgs_arg = pil_frames if pil_frames else None
+        try:
+            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = processor(text=[text], images=imgs_arg, return_tensors="pt", padding=True).to(device)
+        except Exception:
+            inputs = processor(text=[user_instr], images=imgs_arg, return_tensors="pt", padding=True).to(device)
+
+        if seed:
+            try:
+                torch.manual_seed(int(seed))
+            except Exception:
+                pass
+
+        with torch.inference_mode():
+            generated = model.generate(**inputs, max_new_tokens=int(max_new_tokens))
+        trimmed = generated[:, inputs["input_ids"].shape[1]:]
+        out_text = processor.batch_decode(
+            trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0].strip()
+
+        # separa raciocinio x prompt final quando verbose
+        reasoning = ""
+        enhanced = out_text
+        if verbose_reasoning:
+            low = out_text.lower()
+            pi = low.rfind("prompt:")
+            if pi != -1:
+                enhanced = out_text[pi + len("prompt:"):].strip()
+                ri = low.find("reasoning:")
+                reasoning = out_text[ri + len("reasoning:"):pi].strip() if ri != -1 else out_text[:pi].strip()
+        # limpeza leve: tira aspas/rotulos que o modelo as vezes cola
+        enhanced = enhanced.strip().strip('"').strip("'").strip()
+        for lbl in ("rewritten instruction:", "instruction:", "prompt:"):
+            if enhanced.lower().startswith(lbl):
+                enhanced = enhanced[len(lbl):].strip()
+
+        if not keep_loaded:
+            _BX_QWEN_CACHE.update({"name": None, "model": None, "processor": None})
+            try:
+                del model, processor
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        print(f"[Bernini PromptEnhancer] task={task} | in={len(user_instr)}ch -> out={len(enhanced)}ch"
+              f"{' | +grounding' if pil_frames else ''}", flush=True)
+        return (enhanced, reasoning)
+
+
 NODE_CLASS_MAPPINGS["BruxosPad4n1"] = BruxosPad4n1
 NODE_CLASS_MAPPINGS["BruxosTrim4n1"] = BruxosTrim4n1
 NODE_CLASS_MAPPINGS["BruxosQwenVLCaption"] = BruxosQwenVLCaption
+NODE_CLASS_MAPPINGS["BruxosBerniniPromptEnhancer"] = BruxosBerniniPromptEnhancer
 
 NODE_DISPLAY_NAME_MAPPINGS["BruxosPad4n1"] = "Pad to 4n+1 (Bruxos)"
 NODE_DISPLAY_NAME_MAPPINGS["BruxosTrim4n1"] = "Trim 4n+1 back to N (Bruxos)"
 NODE_DISPLAY_NAME_MAPPINGS["BruxosQwenVLCaption"] = "Qwen-VL Caption (Bruxos)"
+NODE_DISPLAY_NAME_MAPPINGS["BruxosBerniniPromptEnhancer"] = "Bernini Prompt Enhancer (Bruxos)"
 
 
 # =============================================================================
@@ -2053,3 +2476,383 @@ BruxosFaceCropExpand.DESCRIPTION = (
     "SAIDAS: face_images (crops com mais contexto) e face_bboxes (expandidos — "
     "ligue no FaceStitchUpscale p/ manter o alinhamento)."
 )
+
+
+
+
+# =============================================================================
+# Bernini Multi-Guidance (Bruxos)  —  guidance independente por stream
+# -----------------------------------------------------------------------------
+# Implementa a decomposicao de guidance do paper (eq. 8-12) ATE onde o engine
+# Comfy-Bernini permite. O BerniniConditioning anexa os context_latents
+# (video-fonte + refs) ao positivo E ao negativo iguais -> hoje eles NAO tem
+# forca ajustavel. Este guider roda o modelo com subconjuntos dos streams e
+# combina com escalas independentes:
+#     e0 = modelo(sem contexto,   texto-neg)
+#     e1 = modelo(+video-fonte,   texto-neg)
+#     e2 = modelo(+video+refs,    texto-neg)
+#     e3 = modelo(+video+refs,    texto-pos)
+#     out = e0 + w_vid*(e1-e0) + w_img*(e2-e1) + w_txt*(e3-e2)
+# = eq. 8-12 SEM o termo w_tgt (que vem do planner MLLM; este port e DiT-only).
+# Custa ate 4 forward passes por step (mais lento). Se nao houver context_latents,
+# cai pro CFG normal (2 passes). Feature-detect + fallback: se a API de sampler
+# do fork nao bater, o node avisa em PT em vez de quebrar o grafo.
+# Saida GUIDER -> ligue no SamplerCustomAdvanced.
+# =============================================================================
+
+try:
+    import comfy.samplers as _bx_samplers
+except Exception:
+    _bx_samplers = None
+try:
+    import node_helpers as _bx_node_helpers
+except Exception:
+    _bx_node_helpers = None
+
+# task -> (w_txt, w_vid, w_img, steps, shift)   [modo full/paper; w_txt=cfg]
+_BX_BERNINI_GUIDANCE = {
+    "T2V":  (4.0, 0.0, 1.0, 60, 5.0),   # sem video-fonte
+    "S2V/R2V": (4.0, 1.25, 2.5, 40, 5.0),
+    "V2V":  (4.0, 1.25, 1.25, 40, 5.0),
+    "RV2V": (4.0, 1.25, 3.0, 40, 5.0),
+}
+_BX_BERNINI_GUIDANCE_TASKS = list(_BX_BERNINI_GUIDANCE.keys())
+
+
+def _bx_cond_dict(item):
+    """Retorna o dict de metadados de um item de conditioning, seja no formato
+    cru [tensor, dict] ou ja processado (dict direto)."""
+    if isinstance(item, dict):
+        return item
+    try:
+        if len(item) >= 2 and isinstance(item[1], dict):
+            return item[1]
+    except Exception:
+        pass
+    return None
+
+
+def _bx_ctx_of(cond):
+    """Extrai a lista context_latents de um conditioning (ou [] se nao houver)."""
+    if not cond:
+        return []
+    for item in cond:
+        d = _bx_cond_dict(item)
+        if d and d.get("context_latents"):
+            return list(d["context_latents"])
+    return []
+
+
+def _bx_set_ctx(cond, ctx):
+    """Copia o conditioning com context_latents = ctx (ou removido se None),
+    PRESERVANDO o formato (cru [t,d] ou processado dict)."""
+    out = []
+    for item in cond:
+        if isinstance(item, dict):
+            d = dict(item)
+            if ctx is None:
+                d.pop("context_latents", None)
+            else:
+                d["context_latents"] = list(ctx)
+            out.append(d)
+        else:
+            t = item[0]
+            d = dict(item[1]) if len(item) > 1 and isinstance(item[1], dict) else {}
+            if ctx is None:
+                d.pop("context_latents", None)
+            else:
+                d["context_latents"] = list(ctx)
+            out.append([t, d])
+    return out
+
+
+if _bx_samplers is not None and hasattr(_bx_samplers, "CFGGuider"):
+
+    class _BerniniMultiGuider(_bx_samplers.CFGGuider):
+        """CFGGuider que faz guidance independente por stream (video/refs/texto)."""
+
+        def set_bernini(self, w_txt, w_vid, w_img):
+            self._w_txt = float(w_txt)
+            self._w_vid = float(w_vid)
+            self._w_img = float(w_img)
+
+        def predict_noise(self, x, timestep, model_options={}, seed=None):
+            pos = self.conds.get("positive")
+            neg = self.conds.get("negative")
+            ctx = _bx_ctx_of(pos) if pos else []
+
+            # sem contexto no formato esperado -> CFG classico + diagnostico 1x.
+            # (acontece em T2V, ou se o formato interno do cond deste fork diferir;
+            #  nesse caso o node NAO quebra: roda igual ao CFG normal e imprime o
+            #  formato pra ajustarmos o slicer.)
+            if not ctx:
+                if not getattr(self, "_bx_diag_done", False):
+                    self._bx_diag_done = True
+                    try:
+                        s = pos[0] if pos else None
+                        keys = list(s.keys()) if isinstance(s, dict) else "(cru [t,d])"
+                        print(f"[Bernini Multi-Guidance][diag] context_latents nao encontrado no "
+                              f"formato esperado; usando CFG padrao. cond[0]={type(s).__name__} "
+                              f"keys={keys}. Se esperava multi, mande esta linha pro Claude.", flush=True)
+                    except Exception:
+                        pass
+                return super().predict_noise(x, timestep, model_options, seed)
+
+            vid = ctx[:1]           # 1o stream = video-fonte (BerniniConditioning ordena assim)
+            allc = ctx              # video + refs
+
+            c0 = _bx_set_ctx(neg, None)    # sem contexto, texto-neg
+            c1 = _bx_set_ctx(neg, vid)     # +video,        texto-neg
+            c2 = _bx_set_ctx(neg, allc)    # +video+refs,   texto-neg
+            c3 = _bx_set_ctx(pos, allc)    # +video+refs,   texto-pos
+
+            try:
+                outs = _bx_samplers.calc_cond_batch(
+                    self.inner_model, [c0, c1, c2, c3], x, timestep, model_options
+                )
+            except Exception as e:
+                # fallback seguro: CFG classico
+                print(f"[Bernini Multi-Guidance] calc_cond_batch falhou ({e}); "
+                      f"caindo pro CFG padrao. Rode um smoke test / mande o erro.", flush=True)
+                return super().predict_noise(x, timestep, model_options, seed)
+
+            e0, e1, e2, e3 = outs[0], outs[1], outs[2], outs[3]
+            wv, wi, wt = self._w_vid, self._w_img, self._w_txt
+            return e0 + wv * (e1 - e0) + wi * (e2 - e1) + wt * (e3 - e2)
+
+
+def _bx_multi_sample(model, add_noise, seed, cfg, positive, negative, sampler, sigmas, latent, w_vid, w_img):
+    """Roda UM passo de sampling com guidance multi-stream (usado pelo Bernini
+    Infinity no guidance_mode='multi'). Reusa o SamplerCustomAdvanced canonico
+    (mesmo dominio do SamplerCustom, so troca o guider). Retorna o dict de latent
+    (igual .args[0] do SamplerCustom) ou None p/ cair no caminho padrao."""
+    if _bx_samplers is None or not hasattr(_bx_samplers, "CFGGuider"):
+        return None
+    if not _bx_ctx_of(positive):
+        return None  # sem contexto -> deixa o caminho CFG padrao cuidar
+    try:
+        from comfy_extras.nodes_custom_sampler import (
+            SamplerCustomAdvanced as _SCA,
+            Noise_RandomNoise as _NR,
+            Noise_EmptyNoise as _NE,
+        )
+    except Exception:
+        return None
+    try:
+        guider = _BerniniMultiGuider(model)
+        guider.set_conds(positive, negative)
+        try:
+            guider.set_cfg(float(cfg))
+        except Exception:
+            pass
+        guider.set_bernini(float(cfg), float(w_vid), float(w_img))
+        noise = _NR(int(seed)) if add_noise else _NE()
+        out = _SCA.execute(noise, guider, sampler, sigmas, latent)
+        # SamplerCustomAdvanced devolve (output_latent, denoised); pegamos o 1o
+        res = out.args[0] if hasattr(out, "args") else out[0]
+        return res
+    except Exception as e:
+        print(f"[Bernini Infinity][multi] falhou ({e}); usando CFG padrao neste passo.", flush=True)
+        return None
+
+
+class BruxosBerniniMultiGuidance:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL", {"tooltip": "O modelo Wan/Bernini (o mesmo que iria pro sampler)."}),
+                "positive": ("CONDITIONING", {"tooltip": "Positivo JA com os context_latents (saida do Bernini Conditioning do engine)."}),
+                "negative": ("CONDITIONING", {"tooltip": "Negativo (saida do Bernini Conditioning)."}),
+                "task": (_BX_BERNINI_GUIDANCE_TASKS, {"default": "V2V",
+                    "tooltip": "Preenche w_txt/w_vid/w_img com os valores do paper (Tabela 5). T2V/S2V/V2V/RV2V."}),
+                "mode": (["full (paper)", "lightx2v_turbo"], {"default": "lightx2v_turbo",
+                    "tooltip": "full = valores do paper (modelo SEM distill). lightx2v_turbo = seu LoRA cfg/step-distill: forca w_txt=1.0 (senao QUEIMA)."}),
+            },
+            "optional": {
+                "w_txt": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 30.0, "step": 0.05,
+                    "tooltip": "Guidance de TEXTO (=cfg). -1 = usa o preset (turbo forca 1.0)."}),
+                "w_vid": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 30.0, "step": 0.05,
+                    "tooltip": "Guidance do VIDEO-fonte (adesao ao source). Maior = mais fiel ao original; menor = mais liberdade pra editar. -1 = preset."}),
+                "w_img": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 30.0, "step": 0.05,
+                    "tooltip": "Guidance das IMAGENS/refs. Em RV2V pese mais (paper: 3.0). -1 = preset."}),
+            },
+        }
+
+    RETURN_TYPES = ("GUIDER", "INT", "FLOAT", "STRING")
+    RETURN_NAMES = ("guider", "steps", "shift", "info")
+    OUTPUT_TOOLTIPS = (
+        "Ligue no SamplerCustomAdvanced (entrada 'guider'). Faz a guidance por stream.",
+        "Steps sugeridos do sampler (paper: 60 T2V / 40 demais).",
+        "Flow shift sugerido p/ o ModelSamplingSD3 (paper: 5.0).",
+        "Resumo dos valores + avisos.",
+    )
+    FUNCTION = "build"
+    CATEGORY = "Bruxos do VFX/Bernini"
+    DESCRIPTION = (
+        "Bernini Multi-Guidance: guidance INDEPENDENTE por stream (video-fonte / refs / texto), "
+        "implementando a eq. 8-12 do paper ate onde o engine permite (sem o termo tgt do planner MLLM). "
+        "Custa ate 4 passes por step (mais lento). Sem context_latents cai pro CFG normal. "
+        "Saida GUIDER -> SamplerCustomAdvanced. Tem preset por tarefa e modo turbo (lightx2v)."
+    )
+
+    def build(self, model, positive, negative, task, mode,
+              w_txt=-1.0, w_vid=-1.0, w_img=-1.0):
+        if _bx_samplers is None or not hasattr(_bx_samplers, "CFGGuider"):
+            raise RuntimeError(
+                "[Bernini Multi-Guidance] comfy.samplers.CFGGuider nao encontrado neste build. "
+                "Use o SamplerCustom normal com um cfg unico, ou atualize o ComfyUI."
+            )
+        p_txt, p_vid, p_img, steps, shift = _BX_BERNINI_GUIDANCE[task]
+        turbo = mode == "lightx2v_turbo"
+        if turbo:
+            p_txt = 1.0  # CFG destilado -> texto embutido; w_txt alto queima
+
+        def _ov(v, cur):
+            return float(v) if v is not None and v >= 0.0 else cur
+        wt = _ov(w_txt, p_txt)
+        wv = _ov(w_vid, p_vid)
+        wi = _ov(w_img, p_img)
+
+        guider = _BerniniMultiGuider(model)
+        guider.set_conds(positive, negative)
+        try:
+            guider.set_cfg(wt)   # coerencia com o fallback de CFG classico
+        except Exception:
+            pass
+        guider.set_bernini(wt, wv, wi)
+
+        warn = ""
+        if turbo and wt > 1.5:
+            warn = " | AVISO: w_txt>1.5 com lightx2v costuma QUEIMAR."
+        info = (f"task={task} mode={'turbo' if turbo else 'full'} | "
+                f"w_txt={wt:.2f} w_vid={wv:.2f} w_img={wi:.2f} | steps={steps} shift={shift:.1f}{warn}")
+        print(f"[Bernini Multi-Guidance] {info}", flush=True)
+        return (guider, int(steps), float(shift), info)
+
+
+
+# -----------------------------------------------------------------------------
+# Implementa o "self-vision-text reasoning" do paper (secao 3.6): decompoe a
+# edicao de video em (1) editar o PRIMEIRO FRAME como imagem (estado visual
+# intermediario) e (2) PROPAGAR essa edicao pro video. Dois helpers:
+#   - BruxosFirstFrameExtract : tira o frame 0 pra voce editar (image edit).
+#   - BruxosFirstFrameCompose : recebe o frame editado + o video-fonte e monta
+#     o guia de propagacao (video com o frame 0 trocado), a IMAGE do frame
+#     editado (p/ reference_image) e uma MASK da regiao que mudou.
+# =============================================================================
+
+class BruxosFirstFrameExtract:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Video-fonte (frames). Passo 1 do First-Frame CoT."}),
+            },
+            "optional": {
+                "frame_index": ("INT", {"default": 0, "min": 0, "max": 10_000_000, "step": 1,
+                    "tooltip": "Qual frame extrair (normalmente 0). Esse frame vai pra uma etapa de EDICAO DE IMAGEM."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "INT", "INT")
+    RETURN_NAMES = ("first_frame", "source_video", "frame_index", "num_frames")
+    OUTPUT_TOOLTIPS = (
+        "O frame escolhido (1 frame) — mande pra sua etapa de edicao de imagem (Bernini image edit, etc.).",
+        "O video-fonte, repassado sem alteracao (ligue no Compose depois).",
+        "O indice usado (repassa pro Compose).",
+        "Total de frames do video.",
+    )
+    FUNCTION = "extract"
+    CATEGORY = "Bruxos do VFX/Bernini"
+    DESCRIPTION = ("First-Frame CoT (passo 1): extrai um frame do video pra voce editar como imagem. "
+                   "Depois de editar, use o 'Compose' pra montar o guia de propagacao.")
+
+    def extract(self, images, frame_index=0):
+        n = int(images.shape[0])
+        idx = max(0, min(n - 1, int(frame_index)))
+        first = images[idx:idx + 1]
+        return (first, images, idx, n)
+
+
+class BruxosFirstFrameCompose:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "source_video": ("IMAGE", {"tooltip": "O video-fonte (saida 'source_video' do Extract)."}),
+                "edited_first_frame": ("IMAGE", {"tooltip": "O frame ja EDITADO (saido da sua etapa de edicao de imagem)."}),
+            },
+            "optional": {
+                "frame_index": ("INT", {"default": 0, "min": 0, "max": 10_000_000, "step": 1,
+                    "tooltip": "Mesmo indice usado no Extract (onde o frame editado entra)."}),
+                "make_mask": ("BOOLEAN", {"default": True,
+                    "tooltip": "Gera uma MASK da regiao que mudou entre o frame original e o editado (pra propagacao guiada por regiao)."}),
+                "mask_threshold": ("FLOAT", {"default": 0.04, "min": 0.0, "max": 1.0, "step": 0.005,
+                    "tooltip": "Sensibilidade da diferenca p/ a mascara (menor = pega mudancas mais sutis)."}),
+                "mask_grow": ("INT", {"default": 8, "min": -256, "max": 256, "step": 1,
+                    "tooltip": "Dilata (+) / contrai (-) a mascara da regiao editada, em pixels."}),
+                "mask_blur": ("INT", {"default": 4, "min": 0, "max": 256, "step": 1,
+                    "tooltip": "Suaviza a borda da mascara."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("guide_video", "first_frame", "edit_mask", "info")
+    OUTPUT_TOOLTIPS = (
+        "Video com o frame editado no lugar do frame escolhido — use como guia de propagacao "
+        "(reference_video do Bernini Infinity, ou o video cujo frame 0 e o alvo).",
+        "O frame editado (redimensionado pro tamanho do video) — ligue no reference_image do Bernini Infinity.",
+        "Mascara da regiao que mudou (p/ region_mask, se quiser propagar so ali).",
+        "Resumo (tamanho, % da area alterada).",
+    )
+    FUNCTION = "compose"
+    CATEGORY = "Bruxos do VFX/Bernini"
+    DESCRIPTION = ("First-Frame CoT (passo 2): pega o frame editado + o video-fonte e monta o guia de "
+                   "propagacao (video com o frame 0 trocado), a IMAGE do frame editado (reference_image) "
+                   "e a MASK da regiao alterada (region_mask). Implementa o self-vision-text do paper.")
+
+    def compose(self, source_video, edited_first_frame, frame_index=0,
+                make_mask=True, mask_threshold=0.04, mask_grow=8, mask_blur=4):
+        src = source_video.float()
+        n, H, W = int(src.shape[0]), int(src.shape[1]), int(src.shape[2])
+
+        ef = edited_first_frame.float()
+        if ef.dim() == 3:
+            ef = ef.unsqueeze(0)
+        ef = ef[0:1]
+        # casa o tamanho do frame editado com o do video
+        if int(ef.shape[1]) != H or int(ef.shape[2]) != W:
+            ef = torch.nn.functional.interpolate(
+                ef.permute(0, 3, 1, 2), size=(H, W), mode="bilinear", align_corners=False
+            ).permute(0, 2, 3, 1)
+        ef = ef.clamp(0, 1)
+
+        idx = max(0, min(n - 1, int(frame_index)))
+        guide = src.clone()
+        guide[idx] = ef[0]
+
+        area = 0.0
+        if make_mask:
+            diff = (ef[0, ..., :3] - src[idx, ..., :3]).abs().amax(dim=-1)  # [H,W]
+            m = (diff > float(mask_threshold)).float().unsqueeze(0)          # [1,H,W]
+            try:
+                m = _grow_blur_mask(m, int(mask_grow), int(mask_blur))       # reusa helper do node
+            except Exception:
+                pass
+            m = m.clamp(0, 1)
+            area = 100.0 * float(m.mean().item())
+        else:
+            m = torch.zeros((1, H, W), dtype=torch.float32)
+
+        info = f"{W}x{H} x{n}f | frame editado no idx {idx} | area alterada ~{area:.0f}%"
+        print(f"[Bernini First-Frame CoT] {info}", flush=True)
+        return (guide.clamp(0, 1), ef, m, info)
+
+
+NODE_CLASS_MAPPINGS["BruxosBerniniMultiGuidance"] = BruxosBerniniMultiGuidance
+NODE_CLASS_MAPPINGS["BruxosFirstFrameExtract"] = BruxosFirstFrameExtract
+NODE_CLASS_MAPPINGS["BruxosFirstFrameCompose"] = BruxosFirstFrameCompose
+NODE_DISPLAY_NAME_MAPPINGS["BruxosBerniniMultiGuidance"] = "Bernini Multi-Guidance (Bruxos)"
+NODE_DISPLAY_NAME_MAPPINGS["BruxosFirstFrameExtract"] = "First-Frame CoT: Extrair (Bruxos)"
+NODE_DISPLAY_NAME_MAPPINGS["BruxosFirstFrameCompose"] = "First-Frame CoT: Compor (Bruxos)"
