@@ -1,9 +1,12 @@
 [project]
 name = "ComfyUI-Bruxos-do-VFX"
-description = "Custom nodes by Bruxos do VFX: Bernini long video, face upscale stitch, 4n+1 fix, Qwen caption, native video load/save, and local FaceFusion face swap (ONNX)."
-version = "0.12.0"
-license = { text = "MIT" }
-dependencies = ["onnxruntime-gpu", "opencv-python", "onnx", "requests", "tqdm"]
+description = "Custom nodes by Bruxos do VFX: Bernini long video (Infinity), 4n+1 frame fix, VRAM management, region masks, MoCha, prompt enhancer (self-text CoT), first-frame CoT, face upscale stitch, Qwen caption, native video load/save, and local FaceFusion face swap (ONNX)."
+version = "0.15.0"
+license = { text = "Apache-2.0" }
+dependencies = ["opencv-python", "onnx", "requests", "tqdm", "huggingface_hub", "psutil"]
+
+[project.urls]
+Repository = "https://github.com/bruxos-do-vfx/ComfyUI-Bruxos-do-VFX"
 
 [tool.comfy]
 PublisherId = "bruxos-do-vfx"

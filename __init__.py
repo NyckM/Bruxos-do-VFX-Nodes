@@ -30,6 +30,7 @@ _merge("tracking_nodes")  # camera/objeto/pontos — puxa os trackers instalados
 _merge("tracking_export")  # exporta trajetoria de camera pro VFX (JSON + Nuke .chan)
 _merge("tracking_visualizer")  # desenha os tracks sobre o video (destino visual dos pontos)
 _merge("facefusion_nodes")  # face swap local (ONNX) — so carrega se onnxruntime/opencv presentes
+_merge("mocha_nodes")  # MoCha (Wan/WanVideoWrapper): embeds com fix 4n+1 + info de custo
 
 # ---- rota HTTP que serve os presets do Prompt Guide p/ a extensao JS ----
 try:
@@ -219,7 +220,7 @@ except Exception as e:  # pragma: no cover
 # Banner de inicializacao (logo Bruxos em ASCII verde/roxo)
 try:
     from .banner import print_banner
-    print_banner(node_count=len(NODE_CLASS_MAPPINGS), version="0.12.0")
+    print_banner(node_count=len(NODE_CLASS_MAPPINGS), version="0.15.0")
 except Exception:
     pass
 

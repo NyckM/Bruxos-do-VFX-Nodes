@@ -1,29 +1,36 @@
 # ============================================================================
 # ComfyUI Bruxos do VFX - dependencias
 # ----------------------------------------------------------------------------
-# NOTA sobre onnxruntime-gpu:
-#   NAO liste onnxruntime-gpu aqui com --upgrade. A versao mais nova do PyPI e
-#   build CUDA 13 e quebra o FaceFusion (erro cublasLt64_13.dll -> cai na CPU)
-#   em ambientes CUDA 12.x (torch cu128, padrao do ComfyUI). Use o install.bat,
-#   que crava a build CUDA 12 a partir do feed onnxruntime-cuda-12.
+# REGRA DE OURO: este arquivo NAO lista torch, torchvision, numpy, triton,
+# xformers nem flash-attn. O ComfyUI ja traz o torch, e fixar qualquer um
+# desses aqui QUEBRA o ambiente de quem instalar o pacote. Tudo aqui e
+# dependencia leve e com faixa solta (nunca '==').
+#
+# onnxruntime-gpu NAO entra aqui de proposito: a build tem que CASAR com a
+# CUDA do torch de cada maquina (cu12x -> build CUDA 12; cu13x -> build CUDA 13).
+# Cravar aqui rebaixaria/quebraria o face swap. Quem resolve isso e o
+# install.bat / install.sh, que DETECTA a CUDA e instala a build certa.
 # ============================================================================
 
-# --- base (face swap, download de modelos, video) ---
+# --- base (face swap, download de modelos, video, monitor de memoria) ---
 opencv-python
 onnx
 requests
 tqdm
 huggingface_hub
+psutil          # monitor de RAM no Bernini Infinity (opcional; sem ele so falta a RAM)
 
-# --- deps LEVES p/ os nodes de tracking Bruxos (trajetoria / export / utils) ---
-#     So pip inofensivo. Os MODELOS PESADOS de tracking (DROID-SLAM, DUSt3R,
-#     CoTracker, SpaTracker, GVHMR...) NAO entram aqui: eles vem do pacote de
-#     tracking separado, com o instalador proprio dele (git clone + checkpoints).
-#     Os nodes Bruxos de tracking apenas "puxam" esses trackers se estiverem
-#     instalados; sem eles, os nodes avisam em portugues em vez de quebrar.
+# --- deps LEVES p/ os nodes de tracking (trajetoria / export / utils) ---
+#     Os MODELOS PESADOS de tracking (DROID-SLAM, DUSt3R, CoTracker...) NAO
+#     entram aqui: vem do pacote de tracking separado. Os nodes Bruxos apenas
+#     "puxam" esses trackers se existirem; sem eles, avisam em PT e nao quebram.
 roma
 kornia
 trimesh
 einops
-scipy
 pyyaml
+
+# --- Qwen-VL (Prompt Enhancer / Caption). Descomente ou use o install.bat ---
+# transformers>=4.45
+# accelerate
+# pillow

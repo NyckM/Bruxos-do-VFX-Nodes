@@ -68,22 +68,64 @@ def _mem_report(tag):
     print(f"[Bernini Infinity][mem] {tag}: " + " | ".join(parts), flush=True)
 
 
-def _mem_cleanup(level="leve"):
+def _bx_patch_count(model):
+    """Quantos pesos estao 'patchados' (LoRA etc.) no ModelPatcher. Sob
+    DynamicVRAM/async offload, descarregar um modelo assim obriga a REFAZER o
+    staging (GBs) e RE-APLICAR todos esses patches na passada seguinte -- caro."""
+    if model is None:
+        return 0
+    for attr in ("patches", "object_patches"):
+        try:
+            p = getattr(model, attr, None)
+            if p:
+                return len(p)
+        except Exception:
+            pass
+    return 0
+
+
+# acima disto, um unload entre passos custa re-stage + re-patch (nao compensa)
+_BX_PATCH_HEAVY = 32
+_BX_WARNED = {"unload": False}
+
+
+def _mem_cleanup(level="leve", model=None, between_passes=False):
     """Limpeza de memoria. Niveis:
       off        -> nao faz nada (comportamento legado).
       leve       -> gc.collect() + esvazia cache de VRAM (soft_empty_cache +
                     torch empty_cache/ipc_collect). Barato e seguro.
       agressivo  -> alem do acima, DESCARREGA os modelos da VRAM
-                    (unload_all_models). Garante que high e low nunca fiquem
-                    residentes juntos -> menor pico de VRAM (bom p/ resolucoes
-                    maiores), ao custo de recarregar o modelo (mais lento)."""
+                    (unload_all_models). Menor pico de VRAM, ao custo de
+                    recarregar o modelo.
+
+    IMPORTANTE (DynamicVRAM + LoRA): se o modelo tem MUITOS patches (LoRA
+    distill = centenas), o unload ENTRE os passos high/low e contraproducente:
+    forca re-stage de GBs + re-aplicacao de todos os patches, e isso pode custar
+    minutos por passo. Nesse caso o 'agressivo' vira 'leve' automaticamente
+    entre passos (o unload do FIM da run continua valendo)."""
     if level == "off":
         return
+    do_unload = (level == "agressivo")
+
+    if do_unload and between_passes:
+        n = _bx_patch_count(model)
+        if n >= _BX_PATCH_HEAVY:
+            do_unload = False
+            if not _BX_WARNED["unload"]:
+                _BX_WARNED["unload"] = True
+                print(
+                    f"[Bernini Infinity][mem] limpar_vram=agressivo IGNORADO entre passos: "
+                    f"o modelo tem {n} patches (LoRA). Sob DynamicVRAM/async offload, "
+                    f"descarregar aqui forca re-stage + re-aplicar {n} patches na passada "
+                    f"seguinte (custa MUITO mais do que economiza). Usando limpeza leve. "
+                    f"Se voce NAO esta estourando VRAM, deixe limpar_vram=leve.",
+                    flush=True,
+                )
     try:
         gc.collect()
     except Exception:
         pass
-    if level == "agressivo":
+    if do_unload:
         try:
             comfy.model_management.unload_all_models()
         except Exception:
@@ -856,7 +898,7 @@ class BerniniInfinity:
             "optional": {
                 "limpar_vram": (["off", "leve", "agressivo"], {"default": "leve", "tooltip": "Limpeza de VRAM entre os passos high/low e entre os blocos de frames, pra rodar resolucoes maiores e videos longos sem entupir a GPU. off = nada (legado). leve = gc + esvazia cache da VRAM (barato, recomendado). agressivo = tambem DESCARREGA os modelos entre os passos (high e low nunca ficam juntos na VRAM = menor pico), porem recarrega o modelo a cada troca (mais lento). Use agressivo so se estourar VRAM em resolucao alta."}),
                 "monitor_memoria": ("BOOLEAN", {"default": False, "tooltip": "Imprime no console o uso de RAM e VRAM em tempo real (inicio, entre high/low, por bloco e no fim). Use pra diagnosticar onde a memoria enche. Precisa de CUDA (VRAM) e psutil (RAM); o que faltar aparece em branco."}),
-                "guidance_mode": (["turbo_auto", "full_multi"], {"default": "turbo_auto", "tooltip": "turbo_auto = usa CFG nativo em modelos distill/LightX2V e evita 4 forwards por step. full_multi = guidance independente por stream (video/ref/texto), podendo custar ate 4 passes por step."}),
+                "guidance_mode": (["off", "multi"], {"default": "off", "tooltip": "off = CFG unico normal (recomendado no seu setup). multi = guidance INDEPENDENTE por stream (eq. 8-12 do paper): w_txt=cfg, w_vid (adesao ao video-fonte), w_img (refs). CUIDADO: com cfg=1.0 o ComfyUI ja pula o passe negativo (1 forward/step); o multi faz 4 forwards/step -> ~4x MAIS LENTO. E em modelo cfg-destilado (lightx2v) o multi e fora da distribuicao (o modelo foi treinado pra emitir o resultado ja guiado). So use pra experimentar, em trecho curto."}),
                 "w_vid": ("FLOAT", {"default": 1.25, "min": 0.0, "max": 30.0, "step": 0.05, "tooltip": "[guidance_mode=multi] Peso da adesao ao VIDEO-fonte. Maior = mais fiel ao original; menor = mais liberdade pra editar. Paper: 1.25 (V2V/RV2V)."}),
                 "w_img": ("FLOAT", {"default": 1.25, "min": 0.0, "max": 30.0, "step": 0.05, "tooltip": "[guidance_mode=multi] Peso das IMAGENS/refs. Em RV2V pese mais (paper: 3.0). So tem efeito se houver reference_images/reference_video."}),
                 "region_mask": ("MASK,IMAGE", {"tooltip": "Mascara da regiao a gerar (branco/colorido = gera, preto = mantem a fonte). Aceita MASK ou IMAGE colorida -- pode ligar direto o pose_video_mask/reference_image_mask do 'Create SCAIL-2 Colored Mask'. Use com mask_mode = inpaint ou bbox."}),
@@ -930,20 +972,16 @@ class BerniniInfinity:
         reference_video=None,
         **kwargs,
     ):
-        # guidance: turbo_auto evita o multi-guider de ate 4 forwards;
-        # full_multi preserva a guidance independente por stream.
-        self._g_mode = "multi" if guidance_mode == "full_multi" else "off"
+        # guidance: 'off' = CFG unico (padrao). 'multi' = guidance por stream.
+        self._g_mode = "multi" if guidance_mode == "multi" else "off"
         self._g_wvid = float(w_vid)
         self._g_wimg = float(w_img)
+        self._g_cfg_warned = False
         if monitor_memoria:
             _mem_report("inicio")
         if self._g_mode == "multi":
-            print(f"[Bernini Infinity] guidance_mode=full_multi (w_txt=cfg, w_vid={w_vid}, w_img={w_img}) "
-                  f"-> ate 4 passes/step, mais lento. Fallback p/ CFG se o formato do cond nao bater.",
-                  flush=True)
-        else:
-            print("[Bernini Infinity] guidance_mode=turbo_auto -> CFG nativo/context_latents; "
-                  "multi-guidance de 4 forwards desativado.", flush=True)
+            print(f"[Bernini Infinity] guidance_mode=multi (w_txt=cfg={cfg}, w_vid={w_vid}, w_img={w_img}) "
+                  f"-> 4 forwards/step. Fallback p/ CFG se o formato do cond nao bater.", flush=True)
         frame_count = int(source_video.shape[0])
         target = frame_count if int(max_frames) <= 0 else min(frame_count, int(max_frames))
         chunk_size = int(chunk_size)
@@ -1003,40 +1041,30 @@ class BerniniInfinity:
         sigmas,
         latent,
     ):
-        """
-        Sampling otimizado para Bernini/Wan.
+        """Um passo de sampling.
 
-        Modelos distill / LightX2V com CFG ~= 1 nao devem usar
-        multi-guidance de 4 forwards. O conditioning do Bernini
-        ja contem context_latents com video e referencias.
+        guidance_mode='off'  -> SamplerCustom normal (CFG unico). Em cfg=1.0 o
+          ComfyUI ja pula o passe negativo: 1 forward por step.
+        guidance_mode='multi'-> guider multi-stream (eq. 8-12): 4 forwards por
+          step (~4x mais lento em cfg=1.0). Em modelo cfg-destilado (lightx2v)
+          isso e fora da distribuicao: avisa, mas RESPEITA a escolha do usuario.
+        Se o multi falhar (formato do cond, API do fork), cai pro CFG padrao.
         """
         guidance_mode = getattr(self, "_g_mode", "off")
 
-        # FAST PATH: CFG baixo / modelos destilados.
-        if guidance_mode == "multi" and float(cfg) <= 1.5:
-            if not getattr(self, "_fast_guidance_warned", False):
-                self._fast_guidance_warned = True
+        if guidance_mode == "multi":
+            # aviso honesto (uma vez) -- mas NAO desliga sozinho.
+            if float(cfg) <= 1.5 and not getattr(self, "_g_cfg_warned", False):
+                self._g_cfg_warned = True
                 print(
-                    "[Bernini Infinity][guidance] CFG <= 1.5 detectado. "
-                    "Multi-guidance desativado automaticamente para modelo turbo/distill. "
-                    "Usando conditioning nativo com context_latents.",
+                    f"[Bernini Infinity][guidance] ATENCAO: cfg={float(cfg):.2f} (modelo "
+                    f"cfg-destilado, ex.: lightx2v). Dois efeitos: (1) em cfg=1.0 o CFG normal "
+                    f"faria 1 forward/step, e o multi faz 4 -> ~4x MAIS LENTO; (2) o modelo "
+                    f"destilado foi treinado pra emitir o resultado JA guiado, entao rodar com "
+                    f"subconjuntos de condicao e FORA DA DISTRIBUICAO (pode degradar). "
+                    f"Rodando assim mesmo porque voce pediu. Para desligar: guidance_mode=off.",
                     flush=True,
                 )
-
-            return SamplerCustom.execute(
-                model,
-                add_noise,
-                seed,
-                cfg,
-                positive,
-                negative,
-                sampler,
-                sigmas,
-                latent,
-            ).args[0]
-
-        # FULL MULTI GUIDANCE
-        if guidance_mode == "multi":
             out = _bx_multi_sample(
                 model,
                 add_noise,
@@ -1150,7 +1178,7 @@ class BerniniInfinity:
             # nunca precisam ficar residentes juntos quando 'agressivo').
             if monitor_memoria:
                 _mem_report(f"chunk {chunk_index + 1} pos-high")
-            _mem_cleanup(limpar_vram)
+            _mem_cleanup(limpar_vram, model=high_model, between_passes=True)
             low = self._sample_pass(
                 low_model, False, 0, float(cfg), pos, neg, sampler, low_sigmas, high
             )
@@ -1189,7 +1217,10 @@ class BerniniInfinity:
                 stitched_latents = _merge_latent_overlap(stitched_latents, full_lat, lat_drop)
 
             del high, low, latent, chunk_latent, imgs, pos, neg, context_latents
-            _mem_cleanup(limpar_vram if limpar_vram != "off" else "leve")
+            # entre chunks tambem: um unload aqui forca re-stage + re-patch no
+            # chunk seguinte (caro sob DynamicVRAM). O guard cuida disso.
+            _mem_cleanup(limpar_vram if limpar_vram != "off" else "leve",
+                         model=low_model, between_passes=True)
             if monitor_memoria:
                 _mem_report(f"chunk {chunk_index + 1} fim")
             chunk_index += 1
@@ -1305,7 +1336,7 @@ class BerniniInfinity:
         # limpeza de VRAM entre high pass e low pass
         if monitor_memoria:
             _mem_report("pos-high")
-        _mem_cleanup(limpar_vram)
+        _mem_cleanup(limpar_vram, model=hi, between_passes=True)
         low = self._sample_pass(lo, False, 0, float(cfg), pos, neg, sampler, low_sigmas, high)
         result_latent = low["samples"]
 
@@ -1393,7 +1424,7 @@ class BerniniInfinity:
         # limpeza de VRAM entre high pass e low pass
         if monitor_memoria:
             _mem_report("bbox pos-high")
-        _mem_cleanup(limpar_vram)
+        _mem_cleanup(limpar_vram, model=high_model, between_passes=True)
         low = self._sample_pass(
             low_model.clone(), False, 0, float(cfg), pos, neg, sampler, low_sigmas, high
         )

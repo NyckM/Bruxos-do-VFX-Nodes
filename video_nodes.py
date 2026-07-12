@@ -453,7 +453,88 @@ class BruxosSaveVideo:
     CATEGORY = "Bruxos do VFX/Video"
 
     def _frames_uint8(self, images, pingpong):
-        arr = (images.clamp(0, 1).cpu().numpy() * 255.0).round().astype(np.uint8)
+        t = images
+        # ---- normaliza QUALQUER forma p/ [T,H,W,C] com C em {1,3,4} ----------
+        # O imageio so aceita frame 2D ou 3D com 1/2/3/4 canais. Aqui a gente
+        # tolera o que chegar (5D com batch, mascara 3D, canais extras) em vez
+        # de quebrar la dentro com "Image must have 1, 2, 3 or 4 channels".
+        shape_in = tuple(t.shape)
+        try:
+            # 5D+ (ex.: [B,T,H,W,C]) -> junta/descarta as dims de batch da frente
+            while t.dim() > 4:
+                if int(t.shape[0]) == 1:
+                    t = t[0]                      # batch 1: so remove
+                else:
+                    t = t.reshape(-1, *t.shape[-3:])   # varios: empilha no tempo
+            # 3D: pode ser [T,H,W] (mascara) -> vira 3 canais
+            if t.dim() == 3:
+                t = t.unsqueeze(-1).repeat(1, 1, 1, 3)
+            elif t.dim() == 2:                    # [H,W] -> 1 frame RGB
+                t = t.unsqueeze(0).unsqueeze(-1).repeat(1, 1, 1, 3)
+            if t.dim() != 4:
+                raise ValueError(f"forma nao suportada {shape_in}")
+
+            # channels-first? [T,C,H,W] em vez de [T,H,W,C]. Acontece quando o
+            # VAE ligado nao e o VAE DE VIDEO do Wan (ex.: um VAE 'imageonly' /
+            # 'upscale2x'), que devolve o tensor no layout do torch.
+            c_last, c_first = int(t.shape[-1]), int(t.shape[1])
+            if c_last not in (1, 3, 4) and c_first in (1, 3, 4):
+                print(f"[Bruxos Save Video] *** tensor veio CHANNELS-FIRST {shape_in} "
+                      f"(esperado [frames,altura,largura,canais]). Corrigindo. "
+                      f"CAUSA TIPICA: o VAE ligado nao e o VAE de VIDEO do Wan "
+                      f"(um VAE 'imageonly'/'upscale2x' devolve neste layout). "
+                      f"Troque para o Wan VAE padrao.", flush=True)
+                t = t.permute(0, 2, 3, 1).contiguous()
+
+            c = int(t.shape[-1])
+            if c == 2:                            # 2 canais nao viram video
+                t = t[..., :1]
+                c = 1
+            if c == 1:                            # cinza -> RGB
+                t = t.repeat(1, 1, 1, 3)
+            elif c > 4:                           # canais extras (latente?) -> RGB
+                logging.info(f"[Bruxos Save Video] {c} canais recebidos; usando os 3 primeiros.")
+                t = t[..., :3]
+            elif c == 4 and str(getattr(self, "_drop_alpha", True)):
+                t = t[..., :3]                    # yuv420p nao leva alpha
+        except Exception as e:
+            raise RuntimeError(
+                f"[Bruxos Save Video] nao consegui interpretar o que chegou em 'images': "
+                f"shape={shape_in} ({e}). Esperado um IMAGE [frames, altura, largura, 3]. "
+                f"Confira o node ligado na entrada 'images'."
+            )
+
+        if tuple(t.shape) != shape_in:
+            logging.info(f"[Bruxos Save Video] images {shape_in} -> {tuple(t.shape)} (normalizado)")
+
+        # ---- DIAGNOSTICO: NaN/Inf ou tudo-preto ------------------------------
+        # NaN vira 0 no astype(uint8) => VIDEO PRETO, sem erro nenhum. Melhor
+        # gritar do que gravar um preto silencioso.
+        try:
+            tf = t.float()
+            n_nan = int(torch.isnan(tf).sum())
+            n_inf = int(torch.isinf(tf).sum())
+            vmin = float(tf.nan_to_num(0.0).min())
+            vmax = float(tf.nan_to_num(0.0).max())
+            if n_nan or n_inf:
+                print(f"[Bruxos Save Video] *** ATENCAO: {n_nan} NaN e {n_inf} Inf no video! "
+                      f"NaN vira PRETO no arquivo final. Causa tipica: o modelo gerou lixo "
+                      f"(fp16 estourando -> use bf16, ou modelo quantizado/attention incompativel). "
+                      f"O video sera gravado mesmo assim (NaN -> 0).", flush=True)
+                tf = tf.nan_to_num(0.0, posinf=1.0, neginf=0.0)
+                t = tf
+            elif vmax <= 0.003:
+                print(f"[Bruxos Save Video] *** ATENCAO: o video esta PRETO "
+                      f"(valor maximo={vmax:.4f}). Nao e o Save Video: o que chegou ja veio "
+                      f"preto do node anterior.", flush=True)
+            elif vmax > 1.5 or vmin < -0.5:
+                print(f"[Bruxos Save Video] aviso: valores fora de 0..1 "
+                      f"(min={vmin:.3f} max={vmax:.3f}); vou cortar (clamp).", flush=True)
+            logging.info(f"[Bruxos Save Video] {tuple(t.shape)} min={vmin:.3f} max={vmax:.3f}")
+        except Exception:
+            pass
+
+        arr = (t.clamp(0, 1).cpu().numpy() * 255.0).round().astype(np.uint8)
         frames = [arr[i] for i in range(arr.shape[0])]
         if pingpong and len(frames) > 2:
             frames = frames + frames[-2:0:-1]
