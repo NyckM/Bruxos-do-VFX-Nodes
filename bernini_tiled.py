@@ -36,12 +36,43 @@ except Exception:
 
 # Bernini Infinity do proprio pacote (o motor que roda cada ladrilho)
 try:
-    from .nodes import BerniniInfinity as _BERNINI
+    from .nodes import (
+        BerniniInfinity as _BERNINI,
+        _mask_bbox as _bx_mask_bbox,
+        _align_up_4n1 as _bx_align_up_4n1,
+        _encode_video as _bx_encode_video,
+        _collect_reference_latents as _bx_collect_ref,
+        _clone_conditioning_set_values as _bx_clone_cond,
+        _make_empty_latent as _bx_make_latent,
+        _decode_video as _bx_decode_video,
+        _resize_source_video as _bx_resize_source,
+        _normalize_mask as _bx_norm_mask_fn,
+        _grow_blur_mask as _bx_grow_blur,
+        _rect_feather_mask as _bx_rect_feather,
+        _mem_cleanup as _bx_mem_cleanup,
+    )
 except Exception:
     try:
-        from nodes import BerniniInfinity as _BERNINI  # execucao fora do pacote
+        from nodes import (
+            BerniniInfinity as _BERNINI,
+            _mask_bbox as _bx_mask_bbox,
+            _align_up_4n1 as _bx_align_up_4n1,
+            _encode_video as _bx_encode_video,
+            _collect_reference_latents as _bx_collect_ref,
+            _clone_conditioning_set_values as _bx_clone_cond,
+            _make_empty_latent as _bx_make_latent,
+            _decode_video as _bx_decode_video,
+            _resize_source_video as _bx_resize_source,
+            _normalize_mask as _bx_norm_mask_fn,
+            _grow_blur_mask as _bx_grow_blur,
+            _rect_feather_mask as _bx_rect_feather,
+            _mem_cleanup as _bx_mem_cleanup,
+        )
     except Exception:
         _BERNINI = None
+        _bx_mask_bbox = _bx_align_up_4n1 = _bx_encode_video = _bx_collect_ref = None
+        _bx_clone_cond = _bx_make_latent = _bx_decode_video = _bx_resize_source = None
+        _bx_norm_mask_fn = _bx_grow_blur = _bx_rect_feather = _bx_mem_cleanup = None
 
 try:
     import comfy.samplers as _cs
@@ -124,9 +155,10 @@ class BruxosBerniniInfinityTiled:
                 "sampler_name": (_SAMPLERS, {"tooltip": "Algoritmo de amostragem (ex.: res_multistep, euler)."}),
                 "scheduler": (_SCHEDULERS, {"tooltip": "Scheduler (ex.: simple)."}),
                 "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Forca da modificacao POR ladrilho. 1.0 = gerar/remover/modificar de verdade. 0.3 = so refinar (upscale)."}),
-                "mask_mode": (["off", "inpaint"], {"default": "off", "tooltip": "off = modifica o shot todo (guiado pelo prompt). inpaint = so a area da region_mask muda (remocao/edicao local). Com inpaint + pular_tiles_vazios, ladrilhos fora da mascara NEM RENDERIZAM (mais rapido)."}),
+                "mask_mode": (["off", "inpaint", "bbox"], {"default": "off", "tooltip": "off = modifica o shot todo. inpaint = so a area da mascara muda (renderiza o tile completo). bbox = DUPLO RECORTE: dentro do tile, recorta ainda na bounding box da mascara e roda so essa area (mais rapido se o objeto e pequeno relativo ao tile). Com pular_tiles_vazios, ladrilhos sem mascara nem renderizam."}), 
                 "costura_viva": ("BOOLEAN", {"default": True, "tooltip": "LIGADO (recomendado): cada ladrilho recebe o resultado JA GERADO dos vizinhos na faixa de sobreposicao (com a mascara zerada ali) -> os ladrilhos casam entre si, sem drift de cor/conteudo. DESLIGADO: ladrilhos independentes (so o fade disfarca)."}),
-                "pular_tiles_vazios": ("BOOLEAN", {"default": True, "tooltip": "[inpaint] Ladrilhos onde a mascara nao toca saem direto da fonte, sem renderizar. Remocao em shot grande fica MAIS RAPIDA."}),
+                "pular_tiles_vazios": ("BOOLEAN", {"default": True, "tooltip": "[inpaint/bbox] Ladrilhos onde a mascara nao toca saem direto da fonte, sem renderizar. Remocao em shot grande fica MAIS RAPIDA."}),
+                "bbox_compose": (["rectangle", "silhouette"], {"default": "rectangle", "tooltip": "[bbox] Como colar de volta o resultado do bbox. rectangle = retangulo inteiro com feather nas bordas (sem linha de contorno, recomendado). silhouette = usa o contorno da mascara como alpha."}),
             },
             "optional": {
                 "region_mask": ("MASK,IMAGE", {"tooltip": "Mascara (p/ mask_mode=inpaint). Aceita MASK ou IMAGE colorida (SAM3/SCAIL)."}),
@@ -181,6 +213,60 @@ class BruxosBerniniInfinityTiled:
             mm = torch.cat([mm, mm[-1:].repeat(T - int(mm.shape[0]), 1, 1)], dim=0)
         return mm[:T].clamp(0, 1)
 
+    def _render_bbox_tile(self, src_tile, m_tile, tw, th, T,
+                          positive, negative, high_model, low_model, vae,
+                          seed, steps, split_step, cfg, sampler_name, scheduler, denoise,
+                          chunk_size, overlap_frames, mask_grow, mask_blur,
+                          limpar_vram, monitor_memoria, bbox_compose,
+                          reference_video, **kwargs):
+        """Roda o Bernini no bbox da mascara DENTRO do tile — duplo recorte."""
+        if _bx_mask_bbox is None:
+            raise RuntimeError("[Bernini Tiled][bbox] helpers do nodes.py nao importaram.")
+
+        # bbox da mascara dentro do tile (em pixels do tile)
+        x0, y0, x1, y1 = _bx_mask_bbox(m_tile, int(mask_grow), 16, tw, th)
+        cw, ch = x1 - x0, y1 - y0
+        area_pct = 100.0 * (cw * ch) / (tw * th)
+        print(f"[Bernini Tiled][bbox] regiao no tile: ({x0},{y0})-({x1},{y1}) "
+              f"{cw}x{ch} (~{area_pct:.0f}% do tile {tw}x{th})", flush=True)
+
+        # fonte e mascara recortadas no bbox
+        src_crop = src_tile[:, y0:y1, x0:x1, :].contiguous()
+        m_crop   = m_tile[:, y0:y1, x0:x1].contiguous()
+
+        # roda o Bernini no bbox (resolucao menor)
+        bern = _BERNINI()
+        imgs, _, _ = bern.render(
+            positive=positive, negative=negative,
+            high_model=high_model, low_model=low_model, vae=vae,
+            source_video=src_crop, width=cw, height=ch,
+            seed=int(seed), steps=int(steps), split_step=int(split_step),
+            cfg=float(cfg), sampler_name=sampler_name, scheduler=scheduler,
+            denoise=float(denoise),
+            chunk_size=int(chunk_size), overlap=int(overlap_frames),
+            max_frames=0, tail_memory=True, tail_frames=5,
+            decode_tiled=False, decode_chunk=0, vary_seed_per_chunk=False,
+            ref_max_size=848, mode="context_window", context_jitter=True,
+            mask_mode="inpaint", mask_grow=0, mask_blur=int(mask_blur),
+            mask_pad=0, bbox_compose="rectangle", resize_mode="stretch",
+            limpar_vram=limpar_vram, monitor_memoria=bool(monitor_memoria),
+            guidance_mode="off",
+            region_mask=m_crop, reference_video=reference_video,
+            **kwargs,
+        )
+        crop_imgs = imgs.float().clamp(0, 1)
+        n = min(T, int(crop_imgs.shape[0]))
+
+        # cola de volta no tile completo
+        out = src_tile.clone()
+        if bbox_compose == "rectangle":
+            blend = _bx_rect_feather(n, ch, cw, int(mask_blur)).unsqueeze(-1)
+        else:
+            blend = m_crop[:n].unsqueeze(-1)
+        region = out[:n, y0:y1, x0:x1, :]
+        out[:n, y0:y1, x0:x1, :] = region * (1.0 - blend) + crop_imgs[:n] * blend
+        return out.cpu()
+
     # ------------------------------------------------------------------ main
     def render_tiled(self, positive, negative, high_model, low_model, vae, source_video,
                      width, height, tile_count_width, tile_count_height, tile_overlap,
@@ -188,7 +274,7 @@ class BruxosBerniniInfinityTiled:
                      mask_mode, costura_viva, pular_tiles_vazios,
                      region_mask=None, reference_video=None,
                      mode="context_window", chunk_size=121, overlap_frames=8,
-                     mask_grow=20, mask_blur=6,
+                     mask_grow=20, mask_blur=6, bbox_compose="rectangle",
                      limpar_vram="leve", monitor_memoria=False, **kwargs):
         if not _HAS_TORCH:
             raise RuntimeError("[Bernini Tiled] torch indisponivel.")
@@ -229,8 +315,8 @@ class BruxosBerniniInfinityTiled:
             x0, y0, x1, y1 = t["x0"], t["y0"], t["x1"], t["y1"]
             src_tile = src[:, y0:y1, x0:x1, :].clone()
 
-            # mascara por ladrilho: a do usuario (inpaint) ou tudo-branco (off)
-            if mask_mode == "inpaint":
+            # mascara por ladrilho
+            if mask_mode in ("inpaint", "bbox"):
                 m_tile = umask[:, y0:y1, x0:x1].clone()
             else:
                 m_tile = torch.ones((T, th, tw), dtype=torch.float32)
@@ -253,8 +339,8 @@ class BruxosBerniniInfinityTiled:
                     src_tile[:, iy0 - y0:iy1 - y0, ix0 - x0:ix1 - x0, :] = strip
                     m_tile[:, iy0 - y0:iy1 - y0, ix0 - x0:ix1 - x0] = 0.0
 
-            # ---- pular ladrilho vazio (inpaint): mascara do usuario nao toca ----
-            if (mask_mode == "inpaint" and pular_tiles_vazios
+            # ---- pular ladrilho vazio (inpaint/bbox): mascara do usuario nao toca ----
+            if (mask_mode in ("inpaint", "bbox") and pular_tiles_vazios
                     and float(umask[:, y0:y1, x0:x1].max()) < 0.02):
                 outs[i] = src_tile
                 skipped += 1
@@ -262,7 +348,29 @@ class BruxosBerniniInfinityTiled:
                 print(f"[Bernini Tiled] {log[-1]}", flush=True)
                 continue
 
-            # ---- renderiza o ladrilho com o Bernini COMPLETO ----
+            tt0 = time.time()
+
+            # ---- BBOX: duplo recorte (tile + bbox da mascara dentro do tile) ----
+            if mask_mode == "bbox" and umask is not None:
+                print(f"[Bernini Tiled] tile {i + 1}/{n_tiles} (L{t['r']}C{t['c']}) em ({x0},{y0}) "
+                      f"{tw}x{th} | mask=bbox ...", flush=True)
+                out = self._render_bbox_tile(
+                    src_tile, m_tile, tw, th, T,
+                    positive, negative, high_model, low_model, vae,
+                    int(seed) + i, steps, split_step, cfg,
+                    sampler_name, scheduler, denoise,
+                    chunk_size, overlap_frames, mask_grow, mask_blur,
+                    limpar_vram, monitor_memoria, bbox_compose,
+                    reference_video, **kwargs,
+                )
+                outs[i] = out
+                rendered += 1
+                dt = time.time() - tt0
+                log.append(f"tile {i + 1}/{n_tiles} (L{t['r']}C{t['c']}): bbox ok em {dt:.0f}s")
+                print(f"[Bernini Tiled] {log[-1]}", flush=True)
+                continue
+
+            # ---- renderiza o ladrilho com o Bernini COMPLETO (off / inpaint) ----
             eff_mode = "inpaint" if (mask_mode == "inpaint" or costura_viva) else "off"
             tt0 = time.time()
             print(f"[Bernini Tiled] tile {i + 1}/{n_tiles} (L{t['r']}C{t['c']}) em ({x0},{y0}) "
