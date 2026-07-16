@@ -77,7 +77,9 @@ O `install.bat` baixa tudo isto sozinho. Se preferir na mão:
 
 ### Tiles *(novo)*
 Substituem o subgraph inteiro de "Tile Settings" (Rounding up num, Set dimension properly, Padding, imageSplitTiles, Total tiles, ImageComposite+, Split Images...) por 3 nodes.
+
 https://github.com/user-attachments/assets/2c0222a3-7b5f-4c4f-b430-c3fb6a178218
+
 - **Tile Split (Bruxos)** — corta a imagem/vídeo em ladrilhos pela **contagem** (`tile_count_width` × `tile_count_height`). O **tamanho de cada tile é calculado sozinho** e alinhado ao múltiplo de 16 do Wan. `1×1` = imagem inteira, sem corte.
 - **Tile Select (Bruxos)** — pega o ladrilho N (ligue o `index` do For Loop) **com todos os frames** do vídeo — que é o que o Wan precisa.
 - **Tile Merge (Bruxos)** — costura de volta com **feather na sobreposição** (sem linha de emenda) e **detecta upscale sozinho**: se os tiles voltarem 2× maiores, a imagem final sai 2× maior.
