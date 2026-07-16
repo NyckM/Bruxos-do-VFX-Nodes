@@ -9,7 +9,8 @@ Custom nodes para VFX de vídeo com Bernini-R / Wan 2.2: remoção de objetos e 
 Desenvolvido na **Bruxos do VFX** para dois longas-metragens — *Dr. Monstro* (Marcos Jorge) e *Alice Júnior 2* (Gil Baroni) — onde a demanda de composição e integração de cenas gerou a necessidade de uma ferramenta própria de remoção de objetos sobre Bernini/Wan.
 
 **Resultado:** média de 96 frames em 204 segundos.
-https://github.com/user-attachments/assets/d995aafd-3669-457f-bbd6-8e378e85c8f1
+
+https://github.com/user-attachments/assets/55426421-bdbd-4c04-a727-6dfc95839e19
 
 39 frames em 1920x1080 em 325 segundos.
 
