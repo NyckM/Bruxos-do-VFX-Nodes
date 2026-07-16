@@ -300,6 +300,8 @@ class BruxosLoadVideo:
                                               "tooltip": "Pula os N primeiros frames do video."}),
                 "select_every_nth": ("INT", {"default": 1, "min": 1, "max": 1000,
                                              "tooltip": "Pega 1 a cada N frames."}),
+                "reverse": ("BOOLEAN", {"default": False,
+                                        "tooltip": "Inverte a ordem dos frames (toca o video de tras pra frente). Aplica DEPOIS de skip/cap/nth."}),
             },
         }
 
@@ -309,7 +311,7 @@ class BruxosLoadVideo:
     CATEGORY = "Bruxos do VFX/Video"
 
     def load(self, video, video_path="", force_rate=0.0, custom_width=0, custom_height=0,
-             frame_load_cap=0, skip_first_frames=0, select_every_nth=1):
+             frame_load_cap=0, skip_first_frames=0, select_every_nth=1, reverse=False):
         path = _resolve_path(video, video_path)
         images, src_fps, out_fps = decode_video(
             path, skip_first_frames, frame_load_cap, select_every_nth,
@@ -318,6 +320,8 @@ class BruxosLoadVideo:
         audio = _extract_audio_av(path)
         video_obj = _make_video_obj(images, audio, out_fps if out_fps > 0 else (src_fps or 24.0))
 
+        if reverse and int(images.shape[0]) > 1:
+            images = images.flip(0)
         B, H, W, _ = images.shape
         info = {
             "source_path": path,

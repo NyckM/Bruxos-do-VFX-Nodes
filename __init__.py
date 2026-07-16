@@ -223,7 +223,7 @@ except Exception as e:  # pragma: no cover
 # Banner de inicializacao (logo Bruxos em ASCII verde/roxo)
 try:
     from .banner import print_banner
-    print_banner(node_count=len(NODE_CLASS_MAPPINGS), version="0.19.0")
+    print_banner(node_count=len(NODE_CLASS_MAPPINGS), version="0.19.1")
 except Exception:
     pass
 
