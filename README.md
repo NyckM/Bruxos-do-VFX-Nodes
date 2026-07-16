@@ -10,6 +10,8 @@ Desenvolvido na **Bruxos do VFX** para dois longas-metragens — *Dr. Monstro* (
 
 **Resultado:** média de 96 frames em 204 segundos.
 
+39 frames em 1920x1080 em 325 segundos.
+
 https://github.com/user-attachments/assets/1575f97f-34b9-492a-accb-818e97a6cbde
 
 https://github.com/user-attachments/assets/d1e47486-ac3b-4030-be42-56a0f16b0128
@@ -170,7 +172,8 @@ Para resoluções maiores e vídeos longos, o **Bernini Infinity** limpa a memó
 - **0.14** — **reasoning do paper do Bernini**: `Bernini Prompt Enhancer` (self-text CoT via Qwen local), `First-Frame CoT` (self-vision-text), `Bernini Multi-Guidance` (eq. 8–12, experimental) e o `guidance_mode` no Infinity. Prompt Guide expandido para as **22 tarefas do Bernini-Bench** (35 presets no total).
 - **0.15** — **MoCha** (`Mocha Embeds` + `Mocha Info`), com o fix de frames que o node original não tem. **Save Video** blindado (normaliza tensores malformados; denuncia NaN e vídeo preto em vez de gravar em silêncio). **Instalador refeito**: modelos **Bernini-R INT8 ConvRot** + **LoRAs LightX2V 4-step**, detecção automática da CUDA para o `onnxruntime-gpu`, e downloads idempotentes.
 - **0.16** — **Tiles**: `Tile Split` / `Tile Select` / `Tile Merge` — corte por contagem (2×2, 8×8...) com tamanho automático alinhado a 16, costura com feather (sem emenda) e detecção de upscale. Substituem o subgraph "Tile Settings" inteiro.
-
+**0.19* *cortar em pixels e rodar o pipeline COMPLETO por ladrilho, com a fonte recortada junto. A posição nunca se perde porque o conteúdo do ladrilho É a posição — o modelo vê "um vídeo pequeno completo" (o canto dele) e edita esse vídeo. Nada de RoPE global desalinhado.
+E o drift entre tiles (minha outra preocupação) ele resolve com a "costura viva", que eu reimplementei: cada ladrilho recebe, na faixa de sobreposição, o resultado já gerado dos vizinhos (esquerda/cima/canto) colado na fonte, com a máscara zerada ali → o modelo trata como "já pronto, case com isso". Verifiquei no teste que a strip colada contém o resultado do vizinho, não a fonte.
 ---
 
 ## Por que não há um "Bernini Long Sampler"?
