@@ -898,7 +898,10 @@ class BerniniInfinity:
             "optional": {
                 "limpar_vram": (["off", "leve", "agressivo"], {"default": "leve", "tooltip": "Limpeza de VRAM entre os passos high/low e entre os blocos de frames, pra rodar resolucoes maiores e videos longos sem entupir a GPU. off = nada (legado). leve = gc + esvazia cache da VRAM (barato, recomendado). agressivo = tambem DESCARREGA os modelos entre os passos (high e low nunca ficam juntos na VRAM = menor pico), porem recarrega o modelo a cada troca (mais lento). Use agressivo so se estourar VRAM em resolucao alta."}),
                 "monitor_memoria": ("BOOLEAN", {"default": False, "tooltip": "Imprime no console o uso de RAM e VRAM em tempo real (inicio, entre high/low, por bloco e no fim). Use pra diagnosticar onde a memoria enche. Precisa de CUDA (VRAM) e psutil (RAM); o que faltar aparece em branco."}),
-                "guidance_mode": (["off", "multi"], {"default": "off", "tooltip": "off = CFG unico normal (recomendado no seu setup). multi = guidance INDEPENDENTE por stream (eq. 8-12 do paper): w_txt=cfg, w_vid (adesao ao video-fonte), w_img (refs). CUIDADO: com cfg=1.0 o ComfyUI ja pula o passe negativo (1 forward/step); o multi faz 4 forwards/step -> ~4x MAIS LENTO. E em modelo cfg-destilado (lightx2v) o multi e fora da distribuicao (o modelo foi treinado pra emitir o resultado ja guiado). So use pra experimentar, em trecho curto."}),
+                "guidance_mode": (["off", "multi", "tiled"], {"default": "off", "tooltip": "off = CFG unico normal (recomendado). multi = guidance por stream (eq. 8-12; experimental, ~4x mais lento). tiled = LADRILHO: divide o quadro em tile_w x tile_h e funde a cada passo de denoise -> RESOLUCOES MAIORES sem estourar a VRAM (o modelo so ve um pedaco por vez), sem emenda nem drift. tiled custa mais tempo (varias predicoes por passo), nao qualidade."}),
+                "tile_w": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1, "tooltip": "[tiled] Colunas de ladrilho. 1 = nao corta na horizontal."}),
+                "tile_h": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1, "tooltip": "[tiled] Linhas de ladrilho. 2x2 = 4 pedacos. Suba (3x3, 4x4) se ainda estourar a VRAM."}),
+                "tile_overlap": ("INT", {"default": 8, "min": 1, "max": 64, "step": 1, "tooltip": "[tiled] Sobreposicao entre ladrilhos, em latentes (1 ~ 8px no Wan). Maior = costura mais suave e um pouco mais de VRAM."}),
                 "w_vid": ("FLOAT", {"default": 1.25, "min": 0.0, "max": 30.0, "step": 0.05, "tooltip": "[guidance_mode=multi] Peso da adesao ao VIDEO-fonte. Maior = mais fiel ao original; menor = mais liberdade pra editar. Paper: 1.25 (V2V/RV2V)."}),
                 "w_img": ("FLOAT", {"default": 1.25, "min": 0.0, "max": 30.0, "step": 0.05, "tooltip": "[guidance_mode=multi] Peso das IMAGENS/refs. Em RV2V pese mais (paper: 3.0). So tem efeito se houver reference_images/reference_video."}),
                 "region_mask": ("MASK,IMAGE", {"tooltip": "Mascara da regiao a gerar (branco/colorido = gera, preto = mantem a fonte). Aceita MASK ou IMAGE colorida -- pode ligar direto o pose_video_mask/reference_image_mask do 'Create SCAIL-2 Colored Mask'. Use com mask_mode = inpaint ou bbox."}),
@@ -968,20 +971,33 @@ class BerniniInfinity:
         guidance_mode="off",
         w_vid=1.25,
         w_img=1.25,
+        tile_w=2,
+        tile_h=2,
+        tile_overlap=8,
         region_mask=None,
         reference_video=None,
         **kwargs,
     ):
-        # guidance: 'off' = CFG unico (padrao). 'multi' = guidance por stream.
-        self._g_mode = "multi" if guidance_mode == "multi" else "off"
+        # guidance: 'off' = CFG unico (padrao). 'multi' = por stream. 'tiled' = ladrilho.
+        self._g_mode = guidance_mode if guidance_mode in ("multi", "tiled") else "off"
         self._g_wvid = float(w_vid)
         self._g_wimg = float(w_img)
         self._g_cfg_warned = False
+        # ladrilho (usado quando guidance_mode == 'tiled')
+        self._g_cols = int(tile_w)
+        self._g_rows = int(tile_h)
+        self._g_overlap = int(tile_overlap)
+        self._g_blend = "hann"
+        self._g_tile_cleanup = True
         if monitor_memoria:
             _mem_report("inicio")
         if self._g_mode == "multi":
             print(f"[Bernini Infinity] guidance_mode=multi (w_txt=cfg={cfg}, w_vid={w_vid}, w_img={w_img}) "
                   f"-> 4 forwards/step. Fallback p/ CFG se o formato do cond nao bater.", flush=True)
+        elif self._g_mode == "tiled":
+            print(f"[Bernini Infinity] guidance_mode=tiled ({tile_w}x{tile_h}, overlap {tile_overlap}) "
+                  f"-> ladrilho fundido a cada passo (maiores resolucoes / menos VRAM). "
+                  f"Fallback p/ CFG se o wan_tiled/cond nao baterem.", flush=True)
         frame_count = int(source_video.shape[0])
         target = frame_count if int(max_frames) <= 0 else min(frame_count, int(max_frames))
         chunk_size = int(chunk_size)
@@ -1077,6 +1093,16 @@ class BerniniInfinity:
                 latent,
                 getattr(self, "_g_wvid", 1.25),
                 getattr(self, "_g_wimg", 1.25),
+            )
+            if out is not None:
+                return out
+
+        if guidance_mode == "tiled":
+            out = _bx_tiled_sample(
+                model, add_noise, seed, cfg, positive, negative, sampler, sigmas, latent,
+                getattr(self, "_g_rows", 2), getattr(self, "_g_cols", 2),
+                getattr(self, "_g_overlap", 8), getattr(self, "_g_blend", "hann"),
+                getattr(self, "_g_tile_cleanup", True),
             )
             if out is not None:
                 return out
@@ -2684,6 +2710,48 @@ def _bx_multi_sample(model, add_noise, seed, cfg, positive, negative, sampler, s
         return res
     except Exception as e:
         print(f"[Bernini Infinity][multi] falhou ({e}); usando CFG padrao neste passo.", flush=True)
+        return None
+
+
+# importa o guider de tiling do wan_tiled.py (mesmo pacote). Se faltar, o modo
+# 'tiled' cai pro CFG normal com aviso -- nunca quebra o render.
+try:
+    from .wan_tiled import _WanTiledGuider as _BX_TILED_GUIDER
+except Exception:
+    try:
+        from wan_tiled import _WanTiledGuider as _BX_TILED_GUIDER
+    except Exception:
+        _BX_TILED_GUIDER = None
+
+
+def _bx_tiled_sample(model, add_noise, seed, cfg, positive, negative, sampler, sigmas, latent,
+                     rows, cols, overlap, blend, cleanup):
+    """Um passo de sampling COM LADRILHO (step-fused): o Wan Tiled Guider prediz
+    cada ladrilho e funde a cada passo de denoise. Reusa o SamplerCustomAdvanced
+    canonico (mesmo dominio do SamplerCustom). Retorna o dict de latent, ou None
+    p/ cair no caminho normal."""
+    if _BX_TILED_GUIDER is None or _bx_samplers is None or not hasattr(_bx_samplers, "CFGGuider"):
+        return None
+    if int(rows) <= 1 and int(cols) <= 1:
+        return None  # 1x1 = sem ladrilho -> caminho normal
+    try:
+        from comfy_extras.nodes_custom_sampler import (
+            SamplerCustomAdvanced as _SCA,
+            Noise_RandomNoise as _NR,
+            Noise_EmptyNoise as _NE,
+        )
+    except Exception:
+        return None
+    try:
+        guider = _BX_TILED_GUIDER(model)
+        guider.set_conds(positive, negative)
+        guider.set_cfg(float(cfg))
+        guider.set_tiling(int(rows), int(cols), int(overlap), str(blend), bool(cleanup), False)
+        noise = _NR(int(seed)) if add_noise else _NE()
+        out = _SCA.execute(noise, guider, sampler, sigmas, latent)
+        return out.args[0] if hasattr(out, "args") else out[0]
+    except Exception as e:
+        print(f"[Bernini Infinity][tiled] falhou ({e}); usando CFG padrao neste passo.", flush=True)
         return None
 
 

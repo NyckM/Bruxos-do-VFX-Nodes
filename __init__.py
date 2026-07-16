@@ -31,6 +31,9 @@ _merge("tracking_export")  # exporta trajetoria de camera pro VFX (JSON + Nuke .
 _merge("tracking_visualizer")  # desenha os tracks sobre o video (destino visual dos pontos)
 _merge("facefusion_nodes")  # face swap local (ONNX) — so carrega se onnxruntime/opencv presentes
 _merge("mocha_nodes")  # MoCha (Wan/WanVideoWrapper): embeds com fix 4n+1 + info de custo
+_merge("tile_nodes")  # Tiles: corta/costura por contagem (substitui o subgraph Tile Settings)
+_merge("wan_tiled")   # Wan Tiled Sampler: ladrilho FUNDIDO a cada passo (1 node, sem For Loop)
+_merge("bernini_tiled")  # Bernini Infinity Tiled: ladrilho em PIXELS c/ costura viva (qualquer funcao, resolucao maior)
 
 # ---- rota HTTP que serve os presets do Prompt Guide p/ a extensao JS ----
 try:
@@ -220,7 +223,7 @@ except Exception as e:  # pragma: no cover
 # Banner de inicializacao (logo Bruxos em ASCII verde/roxo)
 try:
     from .banner import print_banner
-    print_banner(node_count=len(NODE_CLASS_MAPPINGS), version="0.15.0")
+    print_banner(node_count=len(NODE_CLASS_MAPPINGS), version="0.19.0")
 except Exception:
     pass
 

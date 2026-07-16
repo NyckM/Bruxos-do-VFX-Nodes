@@ -71,6 +71,32 @@ O `install.bat` baixa tudo isto sozinho. Se preferir na mão:
   > O MoCha usa **uma única máscara** pro vídeo inteiro (não uma por frame). Se você ligar uma máscara por frame, o node reduz por **união** (cobre o sujeito onde quer que ele passe) ou pelo primeiro frame.
 - **Mocha Info (Bruxos)** — calcula **antes de rodar** (sem gastar VRAM) os frames alinhados, o tamanho do latente, o `seq_len` (o custo real) e o plano de blocos.
 
+### Tiles *(novo)*
+Substituem o subgraph inteiro de "Tile Settings" (Rounding up num, Set dimension properly, Padding, imageSplitTiles, Total tiles, ImageComposite+, Split Images...) por 3 nodes.
+
+- **Tile Split (Bruxos)** — corta a imagem/vídeo em ladrilhos pela **contagem** (`tile_count_width` × `tile_count_height`). O **tamanho de cada tile é calculado sozinho** e alinhado ao múltiplo de 16 do Wan. `1×1` = imagem inteira, sem corte.
+- **Tile Select (Bruxos)** — pega o ladrilho N (ligue o `index` do For Loop) **com todos os frames** do vídeo — que é o que o Wan precisa.
+- **Tile Merge (Bruxos)** — costura de volta com **feather na sobreposição** (sem linha de emenda) e **detecta upscale sozinho**: se os tiles voltarem 2× maiores, a imagem final sai 2× maior.
+
+Exemplos reais com uma fonte 1920×1080 (`tile_padding = 80`):
+
+| Grade | Tiles | Tamanho calculado |
+|---|---|---|
+| `1×1` | 1 | 1920×1088 — imagem inteira |
+| `2×2` | 4 | 1120×704 |
+| `8×8` | 64 | 400×304 |
+| `16×16` | 256 | 288×240 |
+
+> **1080 não é múltiplo de 16.** O Split preenche o canvas até 1088 (replicando a borda) e o Merge **recorta de volta** para 1080 — sem isso, 8 linhas seriam perdidas. O round-trip (split → merge) reconstrói a fonte exatamente.
+
+Ligação típica:
+```text
+Load Video ─► Tile Split ─┬─ plan ──────────────────────────────────┐
+                          ├─ total_tiles ─► For Loop Start (total)   │
+                          └─ tiles ─► Tile Select ─► [Wan] ─► acumula┴─► Tile Merge ─► Save
+                                          ▲ index (do For Loop)
+```
+
 ### Face / Troca de rosto *(precisa das libs ONNX)*
 - **FaceFusion Swap (Bruxos)** — troca de rosto **100% local** (ONNX, sem API). Imagem única ou vídeo inteiro, 13 swappers (`hyperswap_1c_256` recomendado), `pixel_boost` até 1024, seleção `one`/`many`/`reference` e máscaras combináveis. Sai com uma **MASK dos rostos** que liga direto no `region_mask` do Bernini Infinity.
 - **FaceFusion Detectar Rostos (Bruxos)** — preview com caixas e landmarks, MASK por frame e contagem.
@@ -143,6 +169,7 @@ Para resoluções maiores e vídeos longos, o **Bernini Infinity** limpa a memó
 - **0.13** — **gerenciamento de memória** no Bernini Infinity: limpeza de VRAM entre high/low e entre blocos, com **guard contra o re-stage/re-patch** sob DynamicVRAM. Widgets `limpar_vram` e `monitor_memoria`.
 - **0.14** — **reasoning do paper do Bernini**: `Bernini Prompt Enhancer` (self-text CoT via Qwen local), `First-Frame CoT` (self-vision-text), `Bernini Multi-Guidance` (eq. 8–12, experimental) e o `guidance_mode` no Infinity. Prompt Guide expandido para as **22 tarefas do Bernini-Bench** (35 presets no total).
 - **0.15** — **MoCha** (`Mocha Embeds` + `Mocha Info`), com o fix de frames que o node original não tem. **Save Video** blindado (normaliza tensores malformados; denuncia NaN e vídeo preto em vez de gravar em silêncio). **Instalador refeito**: modelos **Bernini-R INT8 ConvRot** + **LoRAs LightX2V 4-step**, detecção automática da CUDA para o `onnxruntime-gpu`, e downloads idempotentes.
+- **0.16** — **Tiles**: `Tile Split` / `Tile Select` / `Tile Merge` — corte por contagem (2×2, 8×8...) com tamanho automático alinhado a 16, costura com feather (sem emenda) e detecção de upscale. Substituem o subgraph "Tile Settings" inteiro.
 
 ---
 
