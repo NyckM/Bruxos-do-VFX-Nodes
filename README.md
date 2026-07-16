@@ -10,11 +10,14 @@ Desenvolvido na **Bruxos do VFX** para dois longas-metragens — *Dr. Monstro* (
 
 **Resultados:**
 
+
 Remoção de objetos — média de 96 frames em 204 segundos (832×480):
 
 https://github.com/user-attachments/assets/1575f97f-34b9-492a-accb-818e97a6cbde
 
+
 https://github.com/user-attachments/assets/d1e47486-ac3b-4030-be42-56a0f16b0128
+
 
 Remoção em **1920×1080 Full HD** — 39 frames em 325 segundos:
 
