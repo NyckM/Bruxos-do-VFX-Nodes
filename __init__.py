@@ -20,6 +20,7 @@ def _merge(modname):
 _merge("video_nodes")
 _merge("prompt_guide")
 _merge("loaders")
+_merge("bruxos_load_media")  # Load Image + Crop (box arrastavel, fit crop/stretch/pad)
 _merge("utility_nodes")
 _merge("video_compare")
 _merge("mask_bbox_preview")
@@ -34,6 +35,19 @@ _merge("mocha_nodes")  # MoCha (Wan/WanVideoWrapper): embeds com fix 4n+1 + info
 _merge("tile_nodes")  # Tiles: corta/costura por contagem (substitui o subgraph Tile Settings)
 _merge("wan_tiled")   # Wan Tiled Sampler: ladrilho FUNDIDO a cada passo (1 node, sem For Loop)
 _merge("bernini_tiled")  # Bernini Infinity Tiled: ladrilho em PIXELS c/ costura viva (qualquer funcao, resolucao maior)
+_merge("bernini_tiled_optimized")  # Variante experimental: reduz clones/alocacoes por tile + latent/decode-once + agrupar high/low
+_merge("bernini_tiled_kv_temporal_experimental")  # Variante experimental (corrigido: sem .py no nome do modulo)
+_merge("ltx_tiled_bruxos")  # LTX Tiled Sampler: ladrilho step-fused pro LTX (com timer)
+_merge("ltx_tiled_ic_bruxos")  # LTX Tiled Sampler IC: ciente de IC-LoRA (keyframes) + audio (NestedTensor)
+_merge("mocha_tiled_nodes")  # MoCha BBox Crop/Stitch: roda o MoCha so na regiao do sujeito (bbox + temporal)
+_merge("wanvideo_context_bruxos")  # WanVideo Context: janelas temporais anti-OOM p/ o WanVideo Sampler
+_merge("bernini_i2v_bruxos")  # Bernini I2V / Ref-to-Video: gera video de UMA imagem (sem source_video), KSampler embutido
+_merge("bernini_teacache")  # TeaCache: acelera pulando blocos do transformer (portado do BerniniRWrapper, adaptado ao nativo)
+_merge("bernini_blockswap")  # Block Swap RAM Offload: roda modelo maior que a VRAM (portado do JITBlockSwap; precisa --disable-dynamic-vram)
+_merge("bruxos_wan_upscale")  # Wan Tiled Upscale: substitui o MM_Upscale (tiles + janela temporal + memoria/disco) num node
+_merge("bruxos_prompt_source")  # Prompt Source: switch manual / Qwen-VL / Florence2 -> STRING
+_merge("bruxos_tracked_crop")  # Tracked Crop/Stitch: janela que segue o objeto do SAM3 (crop -> upscale -> stitch)
+_merge("bruxos_ultimate_upscale")  # Ultimate Upscale Video: ESRGAN + UltimateSD + batching num node (rapido)
 
 # ---- rota HTTP que serve os presets do Prompt Guide p/ a extensao JS ----
 try:
@@ -223,7 +237,7 @@ except Exception as e:  # pragma: no cover
 # Banner de inicializacao (logo Bruxos em ASCII verde/roxo)
 try:
     from .banner import print_banner
-    print_banner(node_count=len(NODE_CLASS_MAPPINGS), version="0.19.1")
+    print_banner(node_count=len(NODE_CLASS_MAPPINGS), version="0.20")
 except Exception:
     pass
 

@@ -81,6 +81,19 @@ def _lora_list():
     return ["None"] + _opts("LoraLoaderModelOnly", "lora_name")
 
 
+def _upscale_list():
+    # 1) tenta pelo INPUT_TYPES do UpscaleModelLoader (como os outros)
+    lst = _opts("UpscaleModelLoader", "model_name")
+    # 2) fallback robusto: le a pasta models/upscale_models direto
+    if not lst:
+        try:
+            import folder_paths
+            lst = list(folder_paths.get_filename_list("upscale_models"))
+        except Exception:
+            lst = []
+    return ["None"] + lst
+
+
 def _clip_types():
     t = _opts("CLIPLoader", "type")
     return t if t else ["wan"]
@@ -97,14 +110,22 @@ def _clip_devices():
 
 
 def _call(cls, **kwargs):
-    """Instancia o loader e chama sua FUNCTION passando so os kwargs que ela aceita."""
+    """Instancia o loader e chama sua FUNCTION passando os kwargs que ela aceita.
+    IMPORTANTE: nodes V3 do ComfyUI (0.28+) usam FUNCTION com assinatura **kwargs.
+    Nesse caso NAO da pra filtrar por nome (o inspect so ve 'kwargs') -> temos que
+    passar tudo, senao os argumentos somem e o loader roda com defaults errados
+    (ex.: CLIP carregado como SD1 em vez de wan; upscale sem model_name)."""
     if cls is None:
         raise RuntimeError("loader nao encontrado")
     inst = cls()
     fn = getattr(inst, getattr(cls, "FUNCTION"))
     try:
         params = inspect.signature(fn).parameters
-        accepted = {k: v for k, v in kwargs.items() if k in params}
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if has_var_kw:
+            accepted = kwargs  # node **kwargs (V3): passa tudo
+        else:
+            accepted = {k: v for k, v in kwargs.items() if k in params}
     except (ValueError, TypeError):
         accepted = kwargs
     return fn(**accepted)
@@ -189,6 +210,7 @@ class BruxosWanAllInOneLoader:
         clips = _clip_list()
         vaes = _vae_list()
         loras = _lora_list()
+        upscales = _upscale_list()
         types = _clip_types()
         wdtypes = _weight_dtypes()
         devices = _clip_devices()
@@ -209,11 +231,27 @@ class BruxosWanAllInOneLoader:
                                            "tooltip": "Precisao do UNET safetensors (ignorado em .gguf)."}),
                 "clip_device": (devices, {"default": _default(devices, ("default",)),
                                           "tooltip": "Dispositivo do CLIP (default/cpu)."}),
+                # ---- LIGAR/DESLIGAR modelos (OFF economiza tempo/VRAM) ----
+                "load_high": ("BOOLEAN", {"default": True,
+                    "tooltip": "OFF = NAO carrega o modelo HIGH (saida model_high fica vazia). Ligue OFF quando so usa o LOW (ex.: upscale). Economiza tempo e VRAM."}),
+                "load_low": ("BOOLEAN", {"default": True,
+                    "tooltip": "OFF = NAO carrega o modelo LOW. Ligue OFF quando so usa o HIGH."}),
+                # ---- 2a LoRA por modelo (opcional) ----
+                "high_lora_2": (loras, {"default": "None", "tooltip": "2a LoRA no modelo HIGH (opcional). 'None' = sem."}),
+                "high_lora_2_strength": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.05, "tooltip": "Forca da 2a LoRA high."}),
+                "low_lora_2": (loras, {"default": "None", "tooltip": "2a LoRA no modelo LOW (opcional)."}),
+                "low_lora_2_strength": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.05, "tooltip": "Forca da 2a LoRA low."}),
+                # ---- ModelSamplingSD3 embutido ----
+                "model_shift": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1,
+                    "tooltip": "Shift do ModelSamplingSD3 aplicado nos dois modelos. 0 = desligado. Wan costuma usar 8; alguns fluxos usam 20."}),
+                # ---- Upscale Model (ESRGAN) embutido ----
+                "upscale_model": (upscales, {"default": "None",
+                    "tooltip": "[opcional] Carrega um modelo ESRGAN e devolve na saida 'upscale_model' (liga direto no Wan Tiled Upscale). 'None' = sem."}),
             },
         }
 
-    RETURN_TYPES = ("MODEL", "MODEL", "CLIP", "VAE")
-    RETURN_NAMES = ("model_high", "model_low", "clip", "vae")
+    RETURN_TYPES = ("MODEL", "MODEL", "CLIP", "VAE", "UPSCALE_MODEL")
+    RETURN_NAMES = ("model_high", "model_low", "clip", "vae", "upscale_model")
     FUNCTION = "load_all"
     CATEGORY = "Bruxos do VFX/Loaders"
     DESCRIPTION = ("Carrega tudo num node so: modelo high+LoRA, modelo low+LoRA, CLIP e VAE. "
@@ -249,6 +287,40 @@ class BruxosWanAllInOneLoader:
             if cls is None:
                 raise RuntimeError("Pra carregar CLIP .gguf preciso do node ComfyUI-GGUF (CLIPLoaderGGUF).")
             return _call(cls, clip_name=clip_name, type=clip_type, clip_type=clip_type)[0]
+        # safetensors: carrega DIRETO pelo comfy.sd com o CLIPType explicito.
+        # (o node CLIPLoader do 0.28 estava caindo pra SD1 -> pesos umt5 nao
+        #  encaixavam -> tensor meta. Aqui o tipo 'wan' e garantido.)
+        try:
+            import comfy.sd as _csd
+            path = None
+            for k in ("text_encoders", "clip"):
+                try:
+                    path = _fp.get_full_path(k, clip_name) if _fp else None
+                    if path:
+                        break
+                except Exception:
+                    pass
+            if path:
+                ct = None
+                try:
+                    ct = getattr(_csd.CLIPType, str(clip_type).upper())
+                except Exception:
+                    ct = getattr(_csd.CLIPType, "WAN", None)
+                if ct is None:
+                    ct = getattr(_csd.CLIPType, "STABLE_DIFFUSION")
+                try:
+                    emb = _fp.get_folder_paths("embeddings")
+                except Exception:
+                    emb = None
+                mo = {}
+                if str(clip_device) == "cpu":
+                    import torch as _t
+                    mo = {"load_device": _t.device("cpu"), "offload_device": _t.device("cpu")}
+                clip = _csd.load_clip(ckpt_paths=[path], embedding_directory=emb, clip_type=ct, model_options=mo)
+                print(f"[Bruxos Loader] CLIP direto (comfy.sd) tipo='{clip_type}' -> {type(clip).__name__}", flush=True)
+                return clip
+        except Exception as e:
+            print(f"[Bruxos Loader] load_clip direto falhou ({e}); caindo pro node CLIPLoader.", flush=True)
         cls = _get_cls("CLIPLoader")
         if cls is None:
             raise RuntimeError("CLIPLoader (core) nao encontrado.")
@@ -261,15 +333,56 @@ class BruxosWanAllInOneLoader:
             raise RuntimeError("VAELoader (core) nao encontrado.")
         return _call(cls, vae_name=vae_name)[0]
 
+    def _apply_shift(self, model, shift):
+        if model is None or float(shift) <= 0:
+            return model
+        cls = _get_cls("ModelSamplingSD3")
+        if cls is None:
+            return model
+        return _call(cls, model=model, shift=float(shift))[0]
+
+    def _load_upscale(self, name):
+        if not name or name == "None":
+            return None
+        cls = _get_cls("UpscaleModelLoader")
+        if cls is None:
+            return None
+        try:
+            return _call(cls, model_name=name)[0]
+        except Exception as e:
+            print(f"[Bruxos Loader] upscale model '{name}' nao carregou: {e}", flush=True)
+            return None
+
     def load_all(self, high_model, high_lora, high_lora_strength,
                  low_model, low_lora, low_lora_strength,
                  clip_name, clip_type, vae_name,
-                 weight_dtype="default", clip_device="default"):
-        model_high = self._apply_lora(self._load_unet(high_model, weight_dtype), high_lora, high_lora_strength)
-        model_low = self._apply_lora(self._load_unet(low_model, weight_dtype), low_lora, low_lora_strength)
+                 weight_dtype="default", clip_device="default",
+                 load_high=True, load_low=True,
+                 high_lora_2="None", high_lora_2_strength=1.0,
+                 low_lora_2="None", low_lora_2_strength=1.0,
+                 model_shift=0.0, upscale_model="None"):
+        model_high = None
+        if load_high:
+            m = self._load_unet(high_model, weight_dtype)
+            m = self._apply_lora(m, high_lora, high_lora_strength)
+            m = self._apply_lora(m, high_lora_2, high_lora_2_strength)
+            model_high = self._apply_shift(m, model_shift)
+        else:
+            print("[Bruxos Loader] HIGH desligado (load_high=OFF): nao carregado.", flush=True)
+
+        model_low = None
+        if load_low:
+            m = self._load_unet(low_model, weight_dtype)
+            m = self._apply_lora(m, low_lora, low_lora_strength)
+            m = self._apply_lora(m, low_lora_2, low_lora_2_strength)
+            model_low = self._apply_shift(m, model_shift)
+        else:
+            print("[Bruxos Loader] LOW desligado (load_low=OFF): nao carregado.", flush=True)
+
         clip = self._load_clip(clip_name, clip_type, clip_device)
         vae = self._load_vae(vae_name)
-        return (model_high, model_low, clip, vae)
+        upscale = self._load_upscale(upscale_model)
+        return (model_high, model_low, clip, vae, upscale)
 
 
 NODE_CLASS_MAPPINGS = {"BruxosWanAllInOneLoader": BruxosWanAllInOneLoader}

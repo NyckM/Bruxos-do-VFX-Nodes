@@ -20,6 +20,14 @@ from fractions import Fraction
 import numpy as np
 import torch
 
+# ---- fit/crop compartilhado com o Load Image ------------------------------
+try:
+    from .bruxos_load_media import _bx_apply_fit, ASPECTS as _BX_ASPECTS, FIT_MODES as _BX_FIT_MODES
+except Exception:  # pragma: no cover
+    _bx_apply_fit = None
+    _BX_ASPECTS = ["livre", "1:1", "3:4", "4:3", "16:9", "9:16"]
+    _BX_FIT_MODES = ["off (original)", "crop", "stretch", "pad (letterbox)"]
+
 # ---- ComfyUI helpers (guardados p/ rodar fora do Comfy em teste) ----------
 try:
     import folder_paths
@@ -302,6 +310,23 @@ class BruxosLoadVideo:
                                              "tooltip": "Pega 1 a cada N frames."}),
                 "reverse": ("BOOLEAN", {"default": False,
                                         "tooltip": "Inverte a ordem dos frames (toca o video de tras pra frente). Aplica DEPOIS de skip/cap/nth."}),
+                # ---- FIT / CROP (box arrastavel via JS; aplicado depois do decode) ----
+                "fit_mode": (_BX_FIT_MODES, {"default": "off (original)",
+                    "tooltip": "off = como veio. crop = corta pelo box. stretch = estica pro alvo. pad = encaixa com bordas pretas. Aplica DEPOIS de custom_width/height."}),
+                "target_width": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 8,
+                    "tooltip": "Largura de saida do fit (px). 0 = mantem. So vale se fit_mode != off."}),
+                "target_height": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 8,
+                    "tooltip": "Altura de saida do fit (px). 0 = mantem."}),
+                "aspect": (_BX_ASPECTS, {"default": "livre",
+                    "tooltip": "Proporcao travada do box de corte (1:1, 3:4, 16:9, 9:16...). 'livre' = arrasta a vontade."}),
+                "crop_x": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001,
+                    "tooltip": "Canto esquerdo do box (0..1), movido pelo box arrastavel."}),
+                "crop_y": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001,
+                    "tooltip": "Topo do box (0..1)."}),
+                "crop_w": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.001,
+                    "tooltip": "Largura do box (0..1)."}),
+                "crop_h": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.001,
+                    "tooltip": "Altura do box (0..1)."}),
             },
         }
 
@@ -311,12 +336,27 @@ class BruxosLoadVideo:
     CATEGORY = "Bruxos do VFX/Video"
 
     def load(self, video, video_path="", force_rate=0.0, custom_width=0, custom_height=0,
-             frame_load_cap=0, skip_first_frames=0, select_every_nth=1, reverse=False):
+             frame_load_cap=0, skip_first_frames=0, select_every_nth=1, reverse=False,
+             fit_mode="off (original)", target_width=0, target_height=0,
+             aspect="livre", crop_x=0.0, crop_y=0.0, crop_w=1.0, crop_h=1.0):
         path = _resolve_path(video, video_path)
         images, src_fps, out_fps = decode_video(
             path, skip_first_frames, frame_load_cap, select_every_nth,
             force_rate, custom_width, custom_height,
         )
+        # ---- FIT / CROP (box) aplicado no lote de frames ----
+        if _bx_apply_fit is not None and str(fit_mode).split()[0] != "off":
+            try:
+                dummy_mask = torch.zeros((images.shape[0], images.shape[1], images.shape[2]),
+                                         dtype=images.dtype)
+                images, _ = _bx_apply_fit(
+                    images, dummy_mask, fit_mode,
+                    float(crop_x), float(crop_y), float(crop_w), float(crop_h),
+                    int(target_width), int(target_height),
+                )
+                images = images.contiguous()
+            except Exception as e:
+                logging.warning(f"[Bruxos Load Video] fit/crop falhou ({e}); frames sem corte.")
         audio = _extract_audio_av(path)
         video_obj = _make_video_obj(images, audio, out_fps if out_fps > 0 else (src_fps or 24.0))
 

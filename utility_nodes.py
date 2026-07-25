@@ -424,6 +424,53 @@ class BruxosVideoInfo:
         return (w, h, fps, fc, dur, info)
 
 
+# ---------------------------------------------------------------------------
+# 10) Calculadora 16:9 em multiplos de 16
+# ---------------------------------------------------------------------------
+class BruxosAspect16x9:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "width": ("INT", {
+                    "default": 1920, "min": 16, "max": 16384, "step": 16,
+                    "tooltip": "Largura. No modo largura, alterar este campo recalcula height automaticamente.",
+                }),
+                "height": ("INT", {
+                    "default": 1088, "min": 16, "max": 16384, "step": 16,
+                    "tooltip": "Altura. 1920x1080 vira 1920x1088 para manter multiplo de 16.",
+                }),
+                "calculate_from": (["largura", "altura"], {
+                    "default": "largura",
+                    "tooltip": "Escolhe qual campo dirige o calculo automatico.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("INT", "INT", "STRING")
+    RETURN_NAMES = ("width", "height", "resolution")
+    FUNCTION = "calculate"
+    CATEGORY = "Bruxos do VFX/Utils"
+    DESCRIPTION = (
+        "Calcula uma resolucao 16:9 com largura e altura em multiplos de 16. "
+        "1920 de largura resulta em 1920x1088 (1080 arredondado para o multiplo de 16 mais proximo)."
+    )
+
+    @staticmethod
+    def _multiple16(value):
+        # Arredondamento half-up; evita o bankers rounding de round().
+        return max(16, int(float(value) / 16.0 + 0.5) * 16)
+
+    def calculate(self, width, height=1088, calculate_from="largura"):
+        if calculate_from == "altura":
+            height = self._multiple16(height)
+            width = self._multiple16(height * 16.0 / 9.0)
+        else:
+            width = self._multiple16(width)
+            height = self._multiple16(width * 9.0 / 16.0)
+        return (width, height, f"{width}x{height}")
+
+
 NODE_CLASS_MAPPINGS = {
     "BruxosGrowMaskBlur": BruxosGrowMaskBlur,
     "BruxosBlockifyMask": BruxosBlockifyMask,
@@ -434,6 +481,7 @@ NODE_CLASS_MAPPINGS = {
     "BruxosSeed": BruxosSeed,
     "BruxosLoadImagesPath": BruxosLoadImagesPath,
     "BruxosVideoInfo": BruxosVideoInfo,
+    "BruxosAspect16x9": BruxosAspect16x9,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "BruxosGrowMaskBlur": "Crescer + Borrar Mascara (Bruxos)",
@@ -445,4 +493,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "BruxosSeed": "Seed (Bruxos)",
     "BruxosLoadImagesPath": "Carregar Imagens da Pasta (Bruxos)",
     "BruxosVideoInfo": "Info do Video (Bruxos)",
+    "BruxosAspect16x9": "Calculadora 16:9 · Múltiplos de 16 (Bruxos)",
 }

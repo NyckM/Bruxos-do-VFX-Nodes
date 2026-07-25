@@ -35,7 +35,11 @@ async function uploadFile(file) {
   }
 }
 
-function addUploadButton(nodeType, widgetName) {
+function addUploadButton(nodeType, widgetName, opts) {
+  opts = opts || {};
+  const accept = opts.accept ||
+    "video/webm,video/mp4,video/x-matroska,image/gif,video/quicktime,.mp4,.mov,.mkv,.avi,.webm,.gif,.m4v,.wmv,.flv";
+  const label = opts.label || "📁 escolher vídeo (upload)";
   chainCallback(nodeType.prototype, "onNodeCreated", function () {
     const node = this;
     const pathWidget = node.widgets?.find((w) => w.name === widgetName);
@@ -59,7 +63,7 @@ function addUploadButton(nodeType, widgetName) {
 
     Object.assign(fileInput, {
       type: "file",
-      accept: "video/webm,video/mp4,video/x-matroska,image/gif,video/quicktime,.mp4,.mov,.mkv,.avi,.webm,.gif,.m4v,.wmv,.flv",
+      accept,
       style: "display: none",
       onchange: async () => {
         if (fileInput.files.length) await doUpload(fileInput.files[0]);
@@ -77,11 +81,16 @@ function addUploadButton(nodeType, widgetName) {
 
     document.body.append(fileInput);
 
-    const uploadWidget = node.addWidget("button", "\uD83D\uDCC1 escolher v\u00eddeo (upload)", "upload", () => {
+    const uploadWidget = node.addWidget("button", label, "upload", () => {
       app.canvas.node_widget = null;
       fileInput.click();
     });
+    // ComfyUI 0.28 ignora options.serialize -> forca por propriedade tambem,
+    // senao o botao entra em widgets_values ("upload") e desloca os valores.
+    uploadWidget.options = uploadWidget.options || {};
     uploadWidget.options.serialize = false;
+    uploadWidget.serialize = false;
+    uploadWidget.serializeValue = () => undefined;
   });
 }
 
@@ -90,6 +99,11 @@ app.registerExtension({
   async beforeRegisterNodeDef(nodeType, nodeData) {
     if (nodeData?.name === "BruxosLoadVideo") {
       addUploadButton(nodeType, "video");
+    } else if (nodeData?.name === "BruxosLoadImage") {
+      addUploadButton(nodeType, "image", {
+        accept: "image/png,image/jpeg,image/webp,image/bmp,image/gif,image/tiff,.png,.jpg,.jpeg,.webp,.bmp,.gif,.tif,.tiff",
+        label: "\uD83D\uDCC1 escolher imagem (upload)",
+      });
     }
   },
 });

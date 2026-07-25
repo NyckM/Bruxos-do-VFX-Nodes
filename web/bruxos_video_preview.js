@@ -49,6 +49,12 @@ function ensurePreview(node) {
     serialize: false,
     hideOnZoom: false,
   });
+  // ComfyUI 0.28 ignora options.serialize -> forca por propriedade + serializeValue
+  // pra este widget NAO entrar em widgets_values (senao desloca os valores).
+  try {
+    widget.serialize = false;
+    widget.serializeValue = () => undefined;
+  } catch (e) {}
 
   // No Node 2.0 o container pai do DOMWidget as vezes fica mais largo que o
   // node, e o preview vaza pela direita. Este hook forca, a cada desenho, a

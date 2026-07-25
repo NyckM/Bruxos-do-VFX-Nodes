@@ -89,7 +89,7 @@ _BX_PATCH_HEAVY = 32
 _BX_WARNED = {"unload": False}
 
 
-def _mem_cleanup(level="leve", model=None, between_passes=False):
+def _mem_cleanup(level="leve", model=None, between_passes=False, force_unload=False):
     """Limpeza de memoria. Niveis:
       off        -> nao faz nada (comportamento legado).
       leve       -> gc.collect() + esvazia cache de VRAM (soft_empty_cache +
@@ -102,12 +102,21 @@ def _mem_cleanup(level="leve", model=None, between_passes=False):
     distill = centenas), o unload ENTRE os passos high/low e contraproducente:
     forca re-stage de GBs + re-aplicacao de todos os patches, e isso pode custar
     minutos por passo. Nesse caso o 'agressivo' vira 'leve' automaticamente
-    entre passos (o unload do FIM da run continua valendo)."""
-    if level == "off":
-        return
-    do_unload = (level == "agressivo")
+    entre passos (o unload do FIM da run continua valendo).
 
-    if do_unload and between_passes:
+    force_unload=True: DESCARREGA os modelos IGNORANDO o guard acima. E o que o
+    'force_unload_between_passes' liga: o usuario esta estourando VRAM na
+    transicao high->low (os dois modelos nao cabem juntos na placa) e aceita o
+    custo do re-stage pra que o high saia da VRAM ANTES do low entrar. Vale
+    mesmo com level='off' (a intencao e clara: libere a VRAM aqui)."""
+    if level == "off" and not force_unload:
+        return
+    do_unload = (level == "agressivo") or bool(force_unload)
+
+    # O guard de re-stage so vale pro caminho AUTOMATICO (agressivo). Se o
+    # usuario FORCOU (force_unload), respeitamos a escolha dele -- e exatamente
+    # o caso de OOM em placa unica onde high+low nao cabem juntos.
+    if do_unload and between_passes and not force_unload:
         n = _bx_patch_count(model)
         if n >= _BX_PATCH_HEAVY:
             do_unload = False
@@ -118,9 +127,15 @@ def _mem_cleanup(level="leve", model=None, between_passes=False):
                     f"o modelo tem {n} patches (LoRA). Sob DynamicVRAM/async offload, "
                     f"descarregar aqui forca re-stage + re-aplicar {n} patches na passada "
                     f"seguinte (custa MUITO mais do que economiza). Usando limpeza leve. "
-                    f"Se voce NAO esta estourando VRAM, deixe limpar_vram=leve.",
+                    f"Se voce esta estourando VRAM na transicao high->low, ligue "
+                    f"'force_unload_between_passes' pra forcar o unload mesmo assim.",
                     flush=True,
                 )
+    if force_unload and between_passes and do_unload and not _BX_WARNED.get("forced", False):
+        _BX_WARNED["forced"] = True
+        print("[Bernini Infinity][mem] force_unload_between_passes LIGADO: descarregando o "
+              "modelo high antes do low (evita o pico de 2 modelos na VRAM). Custa um "
+              "re-stage por passo -- ligue so se estava dando OOM na transicao.", flush=True)
     try:
         gc.collect()
     except Exception:
@@ -897,6 +912,7 @@ class BerniniInfinity:
             },
             "optional": {
                 "limpar_vram": (["off", "leve", "agressivo"], {"default": "leve", "tooltip": "Limpeza de VRAM entre os passos high/low e entre os blocos de frames, pra rodar resolucoes maiores e videos longos sem entupir a GPU. off = nada (legado). leve = gc + esvazia cache da VRAM (barato, recomendado). agressivo = tambem DESCARREGA os modelos entre os passos (high e low nunca ficam juntos na VRAM = menor pico), porem recarrega o modelo a cada troca (mais lento). Use agressivo so se estourar VRAM em resolucao alta."}),
+                "force_unload_between_passes": ("BOOLEAN", {"default": False, "tooltip": "[anti-OOM] Descarrega o modelo HIGH da VRAM ANTES de comecar o LOW, IGNORANDO o guard de LoRA. Ligue se der OOM exatamente quando o passo LOW comeca -- e o sinal de que os dois modelos (high+low) nao cabem juntos na placa (ex.: INT8 14B ~14GB cada numa placa de 22GB). Custa um re-stage por passo (mais lento), mas evita o pico. Deixe DESLIGADO se voce NAO esta com OOM."}),
                 "monitor_memoria": ("BOOLEAN", {"default": False, "tooltip": "Imprime no console o uso de RAM e VRAM em tempo real (inicio, entre high/low, por bloco e no fim). Use pra diagnosticar onde a memoria enche. Precisa de CUDA (VRAM) e psutil (RAM); o que faltar aparece em branco."}),
                 "guidance_mode": (["off", "multi", "tiled"], {"default": "off", "tooltip": "off = CFG unico normal (recomendado). multi = guidance por stream (eq. 8-12; experimental, ~4x mais lento). tiled = LADRILHO: divide o quadro em tile_w x tile_h e funde a cada passo de denoise -> RESOLUCOES MAIORES sem estourar a VRAM (o modelo so ve um pedaco por vez), sem emenda nem drift. tiled custa mais tempo (varias predicoes por passo), nao qualidade."}),
                 "tile_w": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1, "tooltip": "[tiled] Colunas de ladrilho. 1 = nao corta na horizontal."}),
@@ -968,6 +984,7 @@ class BerniniInfinity:
         resize_mode="stretch",
         limpar_vram="leve",
         monitor_memoria=False,
+        force_unload_between_passes=False,
         guidance_mode="off",
         w_vid=1.25,
         w_img=1.25,
@@ -1026,6 +1043,7 @@ class BerniniInfinity:
                 bbox_compose=bbox_compose,
                 resize_mode=resize_mode,
                 limpar_vram=limpar_vram, monitor_memoria=monitor_memoria,
+                force_unload_between_passes=force_unload_between_passes,
             )
         return self._render_sequential(
             positive, negative, high_model, low_model, vae, source_video,
@@ -1037,6 +1055,7 @@ class BerniniInfinity:
             mask_grow=mask_grow, mask_blur=mask_blur,
             resize_mode=resize_mode,
             limpar_vram=limpar_vram, monitor_memoria=monitor_memoria,
+            force_unload_between_passes=force_unload_between_passes,
         )
 
     # ------------------------------------------------------------------
@@ -1129,6 +1148,7 @@ class BerniniInfinity:
         region_mask=None, mask_mode="off", mask_grow=0, mask_blur=0,
         resize_mode="stretch",
         limpar_vram="leve", monitor_memoria=False,
+        force_unload_between_passes=False,
     ):
         step = max(1, chunk_size - overlap)
         lat_drop = ((overlap - 1) // 4) + 1 if overlap > 0 else 0
@@ -1204,7 +1224,8 @@ class BerniniInfinity:
             # nunca precisam ficar residentes juntos quando 'agressivo').
             if monitor_memoria:
                 _mem_report(f"chunk {chunk_index + 1} pos-high")
-            _mem_cleanup(limpar_vram, model=high_model, between_passes=True)
+            _mem_cleanup(limpar_vram, model=high_model, between_passes=True,
+                         force_unload=bool(force_unload_between_passes))
             low = self._sample_pass(
                 low_model, False, 0, float(cfg), pos, neg, sampler, low_sigmas, high
             )
@@ -1275,6 +1296,7 @@ class BerniniInfinity:
         bbox_compose="silhouette",
         resize_mode="stretch",
         limpar_vram="leve", monitor_memoria=False,
+        force_unload_between_passes=False,
     ):
         target = int(target)
         # --- alinhamento temporal: trabalhamos no proximo 4n+1 e cortamos depois ---
@@ -1315,6 +1337,7 @@ class BerniniInfinity:
                 reference_video, reference_images, int(mask_pad),
                 bbox_compose=bbox_compose, feather=int(mask_blur),
                 limpar_vram=limpar_vram, monitor_memoria=monitor_memoria,
+                force_unload_between_passes=force_unload_between_passes,
             )
         if use_mask and mask_mode == "bbox" and use_ctx:
             print("[Bernini Infinity][ctx] bbox indisponivel com janelas; "
@@ -1362,7 +1385,8 @@ class BerniniInfinity:
         # limpeza de VRAM entre high pass e low pass
         if monitor_memoria:
             _mem_report("pos-high")
-        _mem_cleanup(limpar_vram, model=hi, between_passes=True)
+        _mem_cleanup(limpar_vram, model=hi, between_passes=True,
+                     force_unload=bool(force_unload_between_passes))
         low = self._sample_pass(lo, False, 0, float(cfg), pos, neg, sampler, low_sigmas, high)
         result_latent = low["samples"]
 
@@ -1417,6 +1441,7 @@ class BerniniInfinity:
         reference_video, reference_images, mask_pad,
         bbox_compose="silhouette", feather=6,
         limpar_vram="leve", monitor_memoria=False,
+        force_unload_between_passes=False,
     ):
         x0, y0, x1, y1 = _mask_bbox(mask_full, int(mask_pad), 16, int(width), int(height))
         cw, ch = x1 - x0, y1 - y0
@@ -1450,7 +1475,8 @@ class BerniniInfinity:
         # limpeza de VRAM entre high pass e low pass
         if monitor_memoria:
             _mem_report("bbox pos-high")
-        _mem_cleanup(limpar_vram, model=high_model, between_passes=True)
+        _mem_cleanup(limpar_vram, model=high_model, between_passes=True,
+                     force_unload=bool(force_unload_between_passes))
         low = self._sample_pass(
             low_model.clone(), False, 0, float(cfg), pos, neg, sampler, low_sigmas, high
         )
@@ -2161,6 +2187,19 @@ _BX_BERNINI_TASK_HINTS = {
 _BX_BERNINI_TASKS = list(_BX_BERNINI_TASK_HINTS.keys())
 
 
+# templates OFICIAIS do prompt-enhancer do Bernini (ByteDance, Apache-2.0)
+try:
+    from .bernini_prompt_templates import (
+        TASK_TYPES as _BX_OFFICIAL_TASKS,
+        parse_task_code as _bx_parse_task_code,
+        build_request as _bx_build_official,
+        parse_json_rewritten as _bx_parse_json_rewritten,
+    )
+except Exception:
+    _BX_OFFICIAL_TASKS = ("off (nao usar template oficial)",)
+    _bx_parse_task_code = _bx_build_official = _bx_parse_json_rewritten = None
+
+
 class BruxosBerniniPromptEnhancer:
     """Prompt Enhancer (self-text CoT) do Bernini via Qwen-VL local.
     Reescreve a instrucao do usuario numa versao estruturada e detalhada,
@@ -2178,6 +2217,8 @@ class BruxosBerniniPromptEnhancer:
                     "tooltip": "Tipo de edicao (taxonomia do Bernini-Bench). Ajusta como a instrucao e reescrita. 'remover' forca instrucao curta; 'estilo' pede consistencia no video todo; etc."}),
             },
             "optional": {
+                "template_oficial": (_BX_OFFICIAL_TASKS, {"default": _BX_OFFICIAL_TASKS[0],
+                    "tooltip": "[recomendado p/ i2v/r2v] Usa o TEMPLATE OFICIAL do prompt-enhancer do Bernini (ByteDance) da tarefa escolhida, no lugar das regras genericas. Ex.: 'r2v' faz o modelo referenciar cada referencia como image0/image1 e descrever a aparencia FIEL a imagem (preserva identidade). 'off' = usa o comportamento antigo. Quando ligado, ele SUBSTITUI o campo 'task'/'system_prompt' pela receita oficial."}),
                 "source_video": ("IMAGE", {"tooltip": "OPCIONAL: frames do video-fonte pra ATERRAR a reescrita (o modelo olha alguns keyframes). Sem isso, a reescrita e so por texto."}),
                 "num_keyframes": ("INT", {"default": 4, "min": 1, "max": 16, "step": 1,
                     "tooltip": "Quantos keyframes amostrar do source_video pra o modelo olhar. Poucos ja bastam pra aterrar."}),
@@ -2230,7 +2271,7 @@ class BruxosBerniniPromptEnhancer:
             source_video=None, num_keyframes=4, extra_rules="",
             verbose_reasoning=False, system_prompt=_BX_BERNINI_ENH_SYSTEM,
             max_new_tokens=256, dtype="fp16", device="auto",
-            keep_loaded=True, seed=0):
+            keep_loaded=True, seed=0, template_oficial=None):
         user_instr = (instruction or "").strip()
         if not user_instr:
             return ("", "")
@@ -2238,16 +2279,11 @@ class BruxosBerniniPromptEnhancer:
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # monta o system prompt: base + diretriz da tarefa + regras extras + modo verbose
-        sys_text = (system_prompt or _BX_BERNINI_ENH_SYSTEM).strip()
-        hint = _BX_BERNINI_TASK_HINTS.get(task, "")
-        if hint:
-            sys_text += "\nTask type: " + hint
-        if (extra_rules or "").strip():
-            sys_text += "\nAdditional user rules (must respect): " + extra_rules.strip()
-        if verbose_reasoning:
-            sys_text += ("\nFirst reason step by step after a line 'REASONING:'. "
-                         "Then output the final instruction after a line 'PROMPT:'.")
+        # ---- TEMPLATE OFICIAL (Bernini/ByteDance) tem prioridade se escolhido ----
+        official_code = None
+        official_is_json = False
+        if template_oficial and _bx_parse_task_code is not None:
+            official_code = _bx_parse_task_code(template_oficial)
 
         model, processor = _bx_qwen_load(model_name, dtype, device)
 
@@ -2259,9 +2295,31 @@ class BruxosBerniniPromptEnhancer:
             except Exception:
                 pil_frames = []
 
+        if official_code and _bx_build_official is not None:
+            # receita oficial: system + template preenchido (referencia image0/image1 etc.)
+            sys_text, user_text, official_is_json = _bx_build_official(
+                official_code, user_instr, image_num=len(pil_frames))
+            if (extra_rules or "").strip():
+                user_text += "\n\nAdditional user rules (must respect): " + extra_rules.strip()
+            final_text = f"{sys_text}\n\n{user_text}"
+            if verbose_reasoning and not official_is_json:
+                final_text += ("\n\nFirst reason step by step after a line 'REASONING:'. "
+                               "Then output the final prompt after a line 'PROMPT:'.")
+        else:
+            # comportamento antigo: base + diretriz da tarefa + regras extras
+            sys_text = (system_prompt or _BX_BERNINI_ENH_SYSTEM).strip()
+            hint = _BX_BERNINI_TASK_HINTS.get(task, "")
+            if hint:
+                sys_text += "\nTask type: " + hint
+            if (extra_rules or "").strip():
+                sys_text += "\nAdditional user rules (must respect): " + extra_rules.strip()
+            if verbose_reasoning:
+                sys_text += ("\nFirst reason step by step after a line 'REASONING:'. "
+                             "Then output the final instruction after a line 'PROMPT:'.")
+            final_text = f"{sys_text}\n\nUser request:\n{user_instr}\n\nRewritten instruction:"
+
         content = [{"type": "image", "image": img} for img in pil_frames]
-        content.append({"type": "text", "text":
-                        f"{sys_text}\n\nUser request:\n{user_instr}\n\nRewritten instruction:"})
+        content.append({"type": "text", "text": final_text})
         messages = [{"role": "user", "content": content}]
 
         imgs_arg = pil_frames if pil_frames else None
@@ -2287,7 +2345,10 @@ class BruxosBerniniPromptEnhancer:
         # separa raciocinio x prompt final quando verbose
         reasoning = ""
         enhanced = out_text
-        if verbose_reasoning:
+        if official_is_json and _bx_parse_json_rewritten is not None:
+            # tarefa oficial JSON-mode: extrai 'rewritten_text'
+            enhanced = _bx_parse_json_rewritten(out_text)
+        elif verbose_reasoning:
             low = out_text.lower()
             pi = low.rfind("prompt:")
             if pi != -1:
@@ -2952,6 +3013,792 @@ class BruxosFirstFrameCompose:
 NODE_CLASS_MAPPINGS["BruxosBerniniMultiGuidance"] = BruxosBerniniMultiGuidance
 NODE_CLASS_MAPPINGS["BruxosFirstFrameExtract"] = BruxosFirstFrameExtract
 NODE_CLASS_MAPPINGS["BruxosFirstFrameCompose"] = BruxosFirstFrameCompose
+# =============================================================================
+# BruxosDepthMask — DVD Depth STANDALONE (autosuficiente, zero deps de outros customs)
+# -----------------------------------------------------------------------------
+# Port completo da inferência DVD (Deterministic Video Depth) baseado no
+# código do comfy-dvd (chettilaura/spiritform fork). NÃO requer o comfy-dvd
+# instalado — traz a lógica de inferência internamente e gerencia o dvd_repo.
+#
+# O dvd_repo (EnVision-Research/DVD) é procurado em:
+#   1. Dentro do próprio pacote Bruxos:  <bruxos>/dvd_repo
+#   2. No comfy-dvd se instalado:        custom_nodes/ComfyUI-DVD-Depth/dvd_repo
+#   3. Baixado automaticamente via git se não encontrado
+#
+# Checkpoint: procura em COMFY_MODEL_TYPE_DVD_DEPTH ou baixa do HuggingFace.
+# =============================================================================
+
+import os as _bx_os3
+import sys as _bx_sys3
+import subprocess as _bx_sub3
+import math as _bx_math3
+import gc as _bx_gc3
+
+_BX_DVD_REPO_URL = "https://github.com/EnVision-Research/DVD.git"
+_BX_DVD_REPO_NAME = "dvd_repo"
+_BX_DVD_HF_REPO = "EnVisionResearch/DVD"
+_BX_DVD_CKPT_NAME = "model.safetensors"
+
+# Diretórios de busca do dvd_repo
+_BX_BRUXOS_ROOT = _bx_os3.path.dirname(_bx_os3.path.abspath(__file__))
+_BX_DVD_REPO_CANDIDATES = [
+    _bx_os3.path.join(_BX_BRUXOS_ROOT, _BX_DVD_REPO_NAME),                           # vendored no Bruxos
+    _bx_os3.path.join(_BX_BRUXOS_ROOT, "..", "ComfyUI-DVD-Depth", _BX_DVD_REPO_NAME), # comfy-dvd paralelo
+    _bx_os3.path.join(_BX_BRUXOS_ROOT, "..", "..", "ComfyUI-DVD-Depth", _BX_DVD_REPO_NAME),
+]
+
+_BX_DVD_ENGINE = {"repo": None, "model": None, "ckpt": None, "device": None}
+
+
+def _bx_dvd_find_repo():
+    """Procura o dvd_repo (EnVision-Research/DVD) nos locais conhecidos."""
+    for path in _BX_DVD_REPO_CANDIDATES:
+        path = _bx_os3.path.abspath(path)
+        init = _bx_os3.path.join(path, "examples", "__init__.py")
+        if _bx_os3.path.isdir(path) and _bx_os3.path.isfile(init):
+            return path
+    return None
+
+
+def _bx_dvd_ensure_repo():
+    """Garante que o dvd_repo existe; clona se necessário."""
+    repo = _bx_dvd_find_repo()
+    if repo is not None:
+        return repo
+
+    target = _bx_os3.path.join(_BX_BRUXOS_ROOT, _BX_DVD_REPO_NAME)
+    if not _bx_os3.path.isdir(target):
+        print(f"[BruxosDepthMask] dvd_repo não encontrado. Clonando {_BX_DVD_REPO_URL}...", flush=True)
+        try:
+            _bx_os3.makedirs(target, exist_ok=True)
+            _bx_sub3.run(
+                ["git", "clone", "--depth", "1", _BX_DVD_REPO_URL, target],
+                check=True, capture_output=True, text=True,
+            )
+            print(f"[BruxosDepthMask] dvd_repo clonado em: {target}", flush=True)
+        except Exception as e:
+            raise RuntimeError(
+                f"[BruxosDepthMask] Não conseguiu clonar o dvd_repo. "
+                f"Clone manualmente: git clone {_BX_DVD_REPO_URL} {target}\nErro: {e}"
+            ) from e
+
+    if not _bx_os3.path.isdir(target):
+        raise RuntimeError(f"[BruxosDepthMask] dvd_repo não existe em: {target}")
+    return target
+
+
+def _bx_dvd_get_ckpt_path(checkpoint_name):
+    """Resolve o path do checkpoint (local ou HF)."""
+    # 1. Tenta via COMFY_MODEL_TYPE_DVD_DEPTH
+    env_paths = _bx_os3.environ.get("COMFY_MODEL_TYPE_DVD_DEPTH", "")
+    if env_paths:
+        for folder in env_paths.split(_bx_os3.pathsep):
+            folder = folder.strip()
+            if not folder:
+                continue
+            candidate = _bx_os3.path.join(folder, checkpoint_name)
+            if _bx_os3.path.isfile(candidate):
+                return candidate
+
+    # 2. Tenta na pasta models/dvd_depth do ComfyUI
+    try:
+        import folder_paths
+        models_dir = _bx_os3.path.join(folder_paths.models_dir, "dvd_depth")
+        candidate = _bx_os3.path.join(models_dir, checkpoint_name)
+        if _bx_os3.path.isfile(candidate):
+            return candidate
+    except Exception:
+        pass
+
+    # 3. Tenta na cache local do Bruxos
+    cache_dir = _bx_os3.path.join(_BX_BRUXOS_ROOT, ".cache", "dvd")
+    _bx_os3.makedirs(cache_dir, exist_ok=True)
+    candidate = _bx_os3.path.join(cache_dir, checkpoint_name)
+    if _bx_os3.path.isfile(candidate):
+        return candidate
+
+    # 4. Baixa do HuggingFace
+    try:
+        from huggingface_hub import hf_hub_download
+        print(f"[BruxosDepthMask] Baixando checkpoint do HuggingFace ({_BX_DVD_HF_REPO})...", flush=True)
+        path = hf_hub_download(
+            repo_id=_BX_DVD_HF_REPO,
+            filename=checkpoint_name,
+            local_dir=cache_dir,
+            local_dir_use_symlinks=False,
+        )
+        return path
+    except Exception as e:
+        raise RuntimeError(
+            f"[BruxosDepthMask] Checkpoint '{checkpoint_name}' não encontrado localmente "
+            f"e não conseguiu baixar do HuggingFace. Coloque o .safetensors em "
+            f"{cache_dir} ou defina COMFY_MODEL_TYPE_DVD_DEPTH. Erro: {e}"
+        ) from e
+
+
+# -------------------------------------------------------------------------
+# Funções auxiliares copiadas/adaptadas do comfy-dvd (Apache-2.0 compatível)
+# -------------------------------------------------------------------------
+def _bx_dvd_compute_scale_and_shift(curr_frames, ref_frames, mask=None):
+    if mask is None:
+        mask = np.ones_like(ref_frames)
+    a_00 = np.sum(mask * curr_frames * curr_frames)
+    a_01 = np.sum(mask * curr_frames)
+    a_11 = np.sum(mask)
+    b_0 = np.sum(mask * curr_frames * ref_frames)
+    b_1 = np.sum(mask * ref_frames)
+    det = a_00 * a_11 - a_01 * a_01
+    if det != 0:
+        scale = (a_11 * b_0 - a_01 * b_1) / det
+        shift = (-a_01 * b_0 + a_00 * b_1) / det
+    else:
+        scale, shift = 1.0, 0.0
+    return scale, shift
+
+
+def _bx_dvd_pad_time_mod4(video_tensor):
+    B, T, C, H, W = video_tensor.shape
+    remainder = T % 4
+    if remainder != 1:
+        pad_len = (4 - remainder + 1) % 4
+        pad_frames = video_tensor[:, -1:, :, :, :].repeat(1, pad_len, 1, 1, 1)
+        video_tensor = torch.cat([video_tensor, pad_frames], dim=1)
+    return video_tensor, T
+
+
+def _bx_dvd_get_window_index(T, window_size, overlap):
+    if T <= window_size:
+        return [(0, T)]
+    res = [(0, window_size)]
+    start = window_size - overlap
+    while start < T:
+        end = start + window_size
+        if end < T:
+            res.append((start, end))
+            start += window_size - overlap
+        else:
+            start = max(0, T - window_size)
+            res.append((start, T))
+            break
+    return res
+
+
+def _bx_dvd_resize_for_model(input_tensor, scale):
+    B, T, C, H, W = input_tensor.shape
+    if scale == 1.0:
+        new_H = (H + 15) // 16 * 16
+        new_W = (W + 15) // 16 * 16
+        if new_H == H and new_W == W:
+            return input_tensor, (H, W)
+    else:
+        new_H = int(H * scale)
+        new_W = int(W * scale)
+        new_H = (new_H + 15) // 16 * 16
+        new_W = (new_W + 15) // 16 * 16
+    video_reshape = input_tensor.view(B * T, C, H, W)
+    resized = F.interpolate(video_reshape, size=(new_H, new_W), mode="bilinear", align_corners=False)
+    return resized.view(B, T, C, new_H, new_W), (H, W)
+
+
+def _bx_dvd_generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, pbar=None):
+    B, T, C, H, W = input_rgb.shape
+    depth_windows = _bx_dvd_get_window_index(T, window_size, overlap)
+    print(f"[BruxosDepthMask] Processing {T} frames in {len(depth_windows)} windows", flush=True)
+
+    depth_res_list = []
+
+    for idx, (start, end) in enumerate(depth_windows):
+        _input_rgb_slice = input_rgb[:, start:end]
+        _input_rgb_slice, origin_T = _bx_dvd_pad_time_mod4(_input_rgb_slice)
+        _input_frame = _input_rgb_slice.shape[1]
+        _input_height, _input_width = _input_rgb_slice.shape[-2:]
+
+        outputs = model.pipe(
+            prompt=[""] * B,
+            negative_prompt=[""] * B,
+            mode=model.args.mode,
+            height=_input_height,
+            width=_input_width,
+            num_frames=_input_frame,
+            batch_size=B,
+            input_image=_input_rgb_slice[:, 0],
+            extra_images=_input_rgb_slice,
+            extra_image_frame_index=torch.ones([B, _input_frame]).to(model.pipe.device),
+            input_video=_input_rgb_slice,
+            cfg_scale=1,
+            seed=0,
+            tiled=False,
+            denoise_step=model.args.denoise_step,
+        )
+        depth_res_list.append(outputs["depth"][:, :origin_T])
+        if pbar:
+            pbar.update(1)
+
+    # Overlap alignment (Global Affine Coherence do paper)
+    depth_list_aligned = None
+    prev_end = None
+
+    for i, (t, (start, end)) in enumerate(zip(depth_res_list, depth_windows)):
+        if i == 0:
+            depth_list_aligned = t
+            prev_end = end
+            continue
+
+        real_overlap = prev_end - start
+        if real_overlap > 0:
+            ref_frames = depth_list_aligned[:, -real_overlap:]
+            curr_frames = t[:, :real_overlap]
+            scale, shift = _bx_dvd_compute_scale_and_shift(curr_frames, ref_frames)
+            scale = np.clip(scale, 0.7, 1.5)
+            aligned_t = t * scale + shift
+            aligned_t[aligned_t < 0] = 0
+
+            alpha = np.linspace(0, 1, real_overlap, dtype=np.float32).reshape(1, real_overlap, 1, 1, 1)
+            smooth_overlap = (1 - alpha) * ref_frames + alpha * aligned_t[:, :real_overlap]
+            depth_list_aligned = np.concatenate([
+                depth_list_aligned[:, :-real_overlap],
+                smooth_overlap,
+                aligned_t[:, real_overlap:],
+            ], axis=1)
+        else:
+            depth_list_aligned = np.concatenate([depth_list_aligned, t], axis=1)
+        prev_end = end
+
+    return depth_list_aligned[:, :T]
+
+
+def _bx_dvd_run_depth(model, input_tensor, orig_size, scale, window_size, overlap, colormap):
+    import matplotlib.cm as cm
+    from comfy.utils import ProgressBar
+
+    T = input_tensor.shape[1]
+    input_tensor, _ = _bx_dvd_resize_for_model(input_tensor, scale)
+    new_H, new_W = input_tensor.shape[-2], input_tensor.shape[-1]
+    print(f"[BruxosDepthMask] {T} frames, {orig_size[0]}x{orig_size[1]} -> processing at {new_H}x{new_W}", flush=True)
+
+    depth_windows = _bx_dvd_get_window_index(T, window_size, overlap)
+    pbar = ProgressBar(len(depth_windows))
+
+    with torch.no_grad():
+        depth = _bx_dvd_generate_depth_sliced(model, input_tensor, window_size, overlap, pbar=pbar)
+
+    depth = depth[0]  # (T, H, W, C)
+
+    # Resize back to original
+    depth_tensor = torch.from_numpy(depth).permute(0, 3, 1, 2).float()
+    depth_tensor = F.interpolate(depth_tensor, size=orig_size, mode="bilinear", align_corners=False)
+    depth = depth_tensor.permute(0, 2, 3, 1).cpu().numpy()
+
+    # Mono depth
+    depth_mono = np.mean(depth, axis=-1)
+    d_min, d_max = depth_mono.min(), depth_mono.max()
+    depth_norm = (depth_mono - d_min) / (d_max - d_min + 1e-8)
+
+    # Apply colormap
+    if colormap == "spectral":
+        cmap = cm.get_cmap("Spectral_r")
+        depth_out = cmap(depth_norm)[:, :, :, :3].astype(np.float32)
+    else:
+        depth_out = np.stack([depth_norm] * 3, axis=-1).astype(np.float32)
+
+    print(f"[BruxosDepthMask] Done! {T} depth frames at {orig_size[0]}x{orig_size[1]}", flush=True)
+    return torch.from_numpy(depth_out)
+
+
+def _bx_dvd_load_model(checkpoint_name, device):
+    """Carrega o modelo DVD standalone (adaptado do comfy-dvd)."""
+    global _BX_DVD_ENGINE
+    if (_BX_DVD_ENGINE["model"] is not None
+            and _BX_DVD_ENGINE["ckpt"] == checkpoint_name
+            and _BX_DVD_ENGINE["device"] == str(device)):
+        print("[BruxosDepthMask] Using cached DVD model", flush=True)
+        return _BX_DVD_ENGINE["model"]
+
+    # Limpa cache anterior
+    if _BX_DVD_ENGINE["model"] is not None:
+        del _BX_DVD_ENGINE["model"]
+        _BX_DVD_ENGINE["model"] = None
+        _bx_gc3.collect()
+        torch.cuda.empty_cache()
+
+    repo = _bx_dvd_ensure_repo()
+    if repo not in _bx_sys3.path:
+        _bx_sys3.path.insert(0, repo)
+
+    ckpt_path = _bx_dvd_get_ckpt_path(checkpoint_name)
+
+    # Imports do DVD (só disponíveis depois que o repo está no path)
+    from accelerate import Accelerator
+    from omegaconf import OmegaConf
+    from safetensors.torch import load_file
+
+    # Monkey-patch huggingface para offline (igual ao comfy-dvd)
+    try:
+        import huggingface_hub as _hf_hub
+        _orig_hf_download = _hf_hub.hf_hub_download
+        def _patched_hf_download(*args, **kwargs):
+            kwargs["local_dir_use_symlinks"] = False
+            if "local_dir" not in kwargs or kwargs["local_dir"] is None:
+                kwargs["local_dir"] = _bx_os3.path.join(_BX_BRUXOS_ROOT, ".cache", "huggingface")
+            return _orig_hf_download(*args, **kwargs)
+        _hf_hub.hf_hub_download = _patched_hf_download
+    except Exception:
+        pass
+
+    config_path = _bx_os3.path.join(repo, "ckpt", "model_config.yaml")
+    if not _bx_os3.path.isfile(config_path):
+        raise FileNotFoundError(f"[BruxosDepthMask] Config não encontrado: {config_path}")
+
+    yaml_args = OmegaConf.load(config_path)
+
+    # Resolve o path base do Wan (procura em COMFY_MODEL_TYPE_DVD_DEPTH ou subpastas)
+    wan_base_path = None
+    env_paths = _bx_os3.environ.get("COMFY_MODEL_TYPE_DVD_DEPTH", "")
+    for folder in env_paths.split(_bx_os3.pathsep):
+        folder = folder.strip()
+        if not folder:
+            continue
+        # Procura Wan_dvd na hierarquia
+        for root, dirs, _ in _bx_os3.walk(folder):
+            if "Wan_dvd" in dirs or "wan_dvd" in [d.lower() for d in dirs]:
+                wan_base_path = _bx_os3.path.join(root, "Wan_dvd" if "Wan_dvd" in dirs else [d for d in dirs if d.lower() == "wan_dvd"][0])
+                break
+        if wan_base_path:
+            break
+
+    if not wan_base_path:
+        # Fallback: procura na pasta models do ComfyUI
+        try:
+            import folder_paths
+            models_dir = folder_paths.models_dir
+            for root, dirs, _ in _bx_os3.walk(models_dir):
+                if "Wan_dvd" in dirs or "wan_dvd" in [d.lower() for d in dirs]:
+                    wan_base_path = _bx_os3.path.join(root, "Wan_dvd" if "Wan_dvd" in dirs else [d for d in dirs if d.lower() == "wan_dvd"][0])
+                    break
+        except Exception:
+            pass
+
+    if not wan_base_path:
+        raise RuntimeError(
+            "[BruxosDepthMask] Wan_dvd base não encontrado. "
+            "Defina COMFY_MODEL_TYPE_DVD_DEPTH apontando para a pasta que contém Wan_dvd/ "
+            "(com os pesos Wan2.1-T2V-1.3B e UMT5-XXL)."
+        )
+
+    tokenizer_root = _bx_os3.path.join(wan_base_path, "Wan-AI", "Wan2.1-T2V-1.3B")
+    local_model_ids = f"Wan-AI/Wan2.1-T2V-1.3B:{wan_base_path},google/umt5-xxl:{wan_base_path}"
+    yaml_args.model_id_with_origin_paths = local_model_ids
+
+    print(f"[BruxosDepthMask] Wan Backend Path: {wan_base_path}", flush=True)
+
+    # Import do training module (disponível após inserir o repo no path)
+    from examples.wanvideo.model_training.WanTrainingModule import WanTrainingModule
+
+    accelerator = Accelerator()
+    model = WanTrainingModule(
+        accelerator=accelerator,
+        model_id_with_origin_paths=local_model_ids,
+        trainable_models=None,
+        use_gradient_checkpointing=False,
+        lora_rank=yaml_args.lora_rank,
+        lora_base_model="dit",
+        args=yaml_args,
+    )
+
+    # Load DVD checkpoint
+    print(f"[BruxosDepthMask] Loading checkpoint: {ckpt_path}", flush=True)
+    state_dict = load_file(ckpt_path, device="cpu")
+    dit_state_dict = {k.replace("pipe.dit.", ""): v for k, v in state_dict.items() if "pipe.dit." in k}
+    model.pipe.dit.load_state_dict(dit_state_dict, strict=True)
+    model.merge_lora_layer()
+
+    model = model.to(device)
+    print(f"[BruxosDepthMask] Model loaded on {device}", flush=True)
+
+    _BX_DVD_ENGINE.update({"repo": repo, "model": model, "ckpt": ckpt_path, "device": str(device)})
+    return model
+
+
+# -------------------------------------------------------------------------
+# Node público: BruxosDepthMask
+# -------------------------------------------------------------------------
+class BruxosDepthMask:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Vídeo de entrada (frames)."}),
+                "vae": ("VAE", {"tooltip": "VAE do Wan2.1 (reaproveitado do pipeline Bernini)."}),
+                "checkpoint": ("STRING", {"default": "model.safetensors",
+                    "tooltip": "Nome do checkpoint DVD (.safetensors). Procura em COMFY_MODEL_TYPE_DVD_DEPTH, models/dvd_depth, ou baixa do HF."}),
+                "scale": (["1.0", "0.75", "0.5", "0.25"], {"default": "0.5",
+                    "tooltip": "Escala de processamento. Menor = menos VRAM."}),
+                "window_size": ("INT", {"default": 81, "min": 5, "max": 161, "step": 4,
+                    "tooltip": "Frames por janela (4n+1). Menor = menos VRAM."}),
+                "overlap": ("INT", {"default": 9, "min": 1, "max": 41, "step": 1,
+                    "tooltip": "Overlap entre janelas para consistência temporal."}),
+                "colormap": (["grayscale", "spectral"], {"default": "grayscale",
+                    "tooltip": "Visualização do depth map."}),
+            },
+            "optional": {
+                "invert": ("BOOLEAN", {"default": False,
+                    "tooltip": "Inverte o depth map."}),
+                "near": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Corte próximo: depth < near vira preto."}),
+                "far": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Corte longe: depth > far vira preto."}),
+                "blur": ("INT", {"default": 0, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "Feather na borda da máscara."}),
+                "device": (["auto", "cuda", "cpu"], {"default": "auto",
+                    "tooltip": "Dispositivo para o modelo DVD."}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK", "IMAGE")
+    RETURN_NAMES = ("depth_mask", "depth_vis")
+    FUNCTION = "run"
+    CATEGORY = "Bruxos do VFX/Mask"
+
+    def run(self, images, vae, checkpoint, scale, window_size, overlap, colormap,
+            invert=False, near=0.0, far=1.0, blur=0, device="auto"):
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Prepara o tensor de entrada no formato que o DVD espera: (1, T, C, H, W)
+        B, H, W, C = images.shape
+        input_tensor = images.permute(0, 3, 1, 2).unsqueeze(0).float()  # (1, T, C, H, W)
+        if input_tensor.max() > 1.0:
+            input_tensor = input_tensor / 255.0
+        orig_size = (H, W)
+
+        # Carrega/roda o DVD
+        model = _bx_dvd_load_model(checkpoint, device)
+        depth_vis = _bx_dvd_run_depth(
+            model, input_tensor, orig_size, float(scale), int(window_size), int(overlap), colormap
+        )
+
+        # depth_vis: (T, H, W, 3) float 0..1 — converte para mask
+        T_out = int(depth_vis.shape[0])
+        masks = []
+
+        for i in range(min(B, T_out)):
+            # Usa a luminância do depth como valor de profundidade
+            d = 0.299 * depth_vis[i, ..., 0] + 0.587 * depth_vis[i, ..., 1] + 0.114 * depth_vis[i, ..., 2]
+            # Normaliza este frame (o DVD já normalizou, mas garantimos)
+            mn, mx = d.min(), d.max()
+            if mx > mn:
+                d = (d - mn) / (mx - mn)
+
+            if invert:
+                d = 1.0 - d
+
+            mask = ((d >= float(near)) & (d <= float(far))).float()
+            if int(blur) > 0:
+                mask = _grow_blur_mask(mask.unsqueeze(0), 0, int(blur)).squeeze(0)
+            masks.append(mask)
+
+        mask_out = torch.stack(masks, dim=0)
+        return (mask_out, depth_vis[:B].clamp(0, 1))
+
+
+BruxosDepthMask.DESCRIPTION = (
+    "DepthMask DVD (Bruxos): máscara de profundidade usando **DVD Depth standalone** — "
+    "NÃO requer o comfy-dvd instalado. Traz a inferência DVD internamente.\n"
+    "- images: vídeo de entrada.\n"
+    "- vae: VAE do Wan2.1 (reaproveitado).\n"
+    "- checkpoint: nome do .safetensors (procura local ou baixa do HF na 1ª vez).\n"
+    "- scale: 0.5 é o sweet spot para 24GB VRAM.\n"
+    "- window_size/overlap: controle de janela temporal (4n+1, igual ao DVD original).\n"
+    "- near/far/blur/invert: pós-processamento da máscara.\n"
+    "O dvd_repo (EnVision-Research/DVD) é clonado automaticamente se não existir. "
+    "SAÍDAS: depth_mask (MASK) e depth_vis (IMAGE)."
+)
+# =============================================================================
+# BruxosColorMatch — match de cor entre vídeos/chunks
+# =============================================================================
+
+class BruxosColorMatch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "source": ("IMAGE", {"tooltip": "Vídeo/frame a ser corrigido."}),
+                "target": ("IMAGE", {"tooltip": "Referência de cor. 1 frame = aplica em todos."}),
+                "mode": (["mean", "mean_std", "histogram", "lab"], {"default": "mean_std",
+                    "tooltip": "mean=média; mean_std=média+contraste; histogram=match completo; lab=só crominância."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("matched",)
+    FUNCTION = "run"
+    CATEGORY = "Bruxos do VFX/Color"
+
+    def run(self, source, target, mode):
+        if np is None:
+            raise RuntimeError("[BruxosColorMatch] numpy não disponível.")
+
+        Bs = int(source.shape[0])
+        Bt = int(target.shape[0])
+        out_frames = []
+
+        for i in range(Bs):
+            src = source[i].detach().cpu().numpy()
+            t_idx = min(i, Bt - 1)
+            tgt = target[t_idx].detach().cpu().numpy()
+
+            if mode == "mean":
+                out = self._mean_match(src, tgt)
+            elif mode == "mean_std":
+                out = self._mean_std_match(src, tgt)
+            elif mode == "histogram":
+                out = self._hist_match(src, tgt)
+            else:
+                out = self._lab_match(src, tgt)
+
+            out_frames.append(torch.from_numpy(out).float())
+
+        return (torch.stack(out_frames, dim=0).clamp(0, 1),)
+
+    def _mean_match(self, src, tgt):
+        out = np.zeros_like(src)
+        for c in range(min(3, src.shape[-1])):
+            out[..., c] = src[..., c] + (tgt[..., c].mean() - src[..., c].mean())
+        return out
+
+    def _mean_std_match(self, src, tgt):
+        out = np.zeros_like(src)
+        for c in range(min(3, src.shape[-1])):
+            sm, tm = src[..., c].mean(), tgt[..., c].mean()
+            ss, ts = src[..., c].std() + 1e-6, tgt[..., c].std() + 1e-6
+            out[..., c] = (src[..., c] - sm) * (ts / ss) + tm
+        return out
+
+    def _hist_match(self, src, tgt):
+        out = np.zeros_like(src)
+        for c in range(min(3, src.shape[-1])):
+            s = src[..., c].flatten()
+            t = tgt[..., c].flatten()
+            s_vals, s_counts = np.unique(s, return_counts=True)
+            t_vals, t_counts = np.unique(t, return_counts=True)
+            s_cdf = np.cumsum(s_counts).astype(np.float64) / s_counts.sum()
+            t_cdf = np.cumsum(t_counts).astype(np.float64) / t_counts.sum()
+            interp = np.interp(s_cdf, t_cdf, t_vals)
+            idx = np.searchsorted(s_vals, s)
+            idx = np.clip(idx, 0, len(interp) - 1)
+            out[..., c] = interp[idx].reshape(src.shape[:2])
+        return out
+
+    def _lab_match(self, src, tgt):
+        if _FSU_HAS_CV2:
+            src_u8 = (src * 255).astype(np.uint8)
+            tgt_u8 = (tgt * 255).astype(np.uint8)
+            src_lab = cv2.cvtColor(src_u8, cv2.COLOR_RGB2LAB).astype(np.float32)
+            tgt_lab = cv2.cvtColor(tgt_u8, cv2.COLOR_RGB2LAB).astype(np.float32)
+            for c in [1, 2]:
+                sm, tm = src_lab[..., c].mean(), tgt_lab[..., c].mean()
+                ss, ts = src_lab[..., c].std() + 1e-6, tgt_lab[..., c].std() + 1e-6
+                src_lab[..., c] = (src_lab[..., c] - sm) * (ts / ss) + tm
+            out = cv2.cvtColor(src_lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
+            return out.astype(np.float32) / 255.0
+        return self._mean_std_match(src, tgt)
+
+
+BruxosColorMatch.DESCRIPTION = (
+    "ColorMatch (Bruxos): ajusta a cor do vídeo 'source' para bater com 'target'. "
+    "Evita drift de cor entre chunks sequenciais.\n"
+    "- mode: mean, mean_std, histogram, lab.\n"
+    "Zero dependências novas — usa só torch/numpy/cv2."
+)
+
+
+# =============================================================================
+# BruxosFrameInterpolator — aumenta taxa de frames
+# =============================================================================
+
+class BruxosFrameInterpolator:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Vídeo de entrada."}),
+                "multiplier": ("INT", {"default": 2, "min": 2, "max": 8, "step": 1,
+                    "tooltip": "Fator de multiplicação. 2x = dobra a taxa de frames."}),
+                "blend_mode": (["flow", "blend"], {"default": "flow",
+                    "tooltip": "flow=Optical Flow Farneback (qualidade); blend=interpolação linear (rápido)."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT")
+    RETURN_NAMES = ("images", "frame_count")
+    FUNCTION = "run"
+    CATEGORY = "Bruxos do VFX/Video"
+
+    def run(self, images, multiplier, blend_mode):
+        if np is None:
+            raise RuntimeError("[BruxosFrameInterpolator] numpy não disponível.")
+        if images.shape[0] < 2:
+            return (images, int(images.shape[0]))
+
+        B, H, W, C = images.shape
+        frames = [images[0].cpu().numpy()]
+        mult = int(multiplier)
+        num_inter = mult - 1
+
+        for i in range(B - 1):
+            f0 = images[i].cpu().numpy()
+            f1 = images[i + 1].cpu().numpy()
+            frames.append(f0)
+
+            if blend_mode == "blend" or not _FSU_HAS_CV2:
+                for k in range(1, num_inter + 1):
+                    t = k / mult
+                    blend = f0 * (1 - t) + f1 * t
+                    frames.append(blend)
+            else:
+                intermediates = self._flow_interpolate(f0, f1, num_inter)
+                for fr in intermediates:
+                    frames.append(fr)
+
+        frames.append(images[-1].cpu().numpy())
+
+        out = torch.from_numpy(np.stack(frames, 0)).float().clamp(0, 1)
+        return (out, int(out.shape[0]))
+
+    def _flow_interpolate(self, f0, f1, num):
+        f0_u8 = (f0 * 255).astype(np.uint8)
+        f1_u8 = (f1 * 255).astype(np.uint8)
+        g0 = cv2.cvtColor(f0_u8, cv2.COLOR_RGB2GRAY)
+        g1 = cv2.cvtColor(f1_u8, cv2.COLOR_RGB2GRAY)
+        flow = cv2.calcOpticalFlowFarneback(g0, g1, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+
+        h, w = f0.shape[:2]
+        y, x = np.mgrid[0:h, 0:w].astype(np.float32)
+        result = []
+
+        for k in range(1, num + 1):
+            t = k / (num + 1)
+            mx = x + t * flow[..., 0]
+            my = y + t * flow[..., 1]
+            warped = cv2.remap(f0_u8, mx, my, cv2.INTER_LINEAR).astype(np.float32)
+            blend = warped * (1 - t) + f1_u8.astype(np.float32) * t
+            result.append(blend / 255.0)
+        return result
+
+
+BruxosFrameInterpolator.DESCRIPTION = (
+    "FrameInterpolator (Bruxos): dobra/triplica a taxa de frames.\n"
+    "- flow: Optical Flow Farneback (OpenCV).\n"
+    "- blend: interpolação linear.\n"
+    "Usa só torch/numpy/cv2."
+)
+
+
+# =============================================================================
+# LyonirExtract — extração de range de luminância/cor com alpha
+# =============================================================================
+
+class LyonirExtract:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Vídeo de entrada."}),
+                "channel": (["luminance", "red", "green", "blue"], {"default": "luminance",
+                    "tooltip": "Canal a analisar: luminance (perceptual), R, G ou B puro."}),
+                "black_point": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001,
+                    "tooltip": "Ponto de corte inferior. Valores ABAIXO disso viram transparente."}),
+                "white_point": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001,
+                    "tooltip": "Ponto de corte superior. Valores ACIMA disso viram transparente."}),
+                "black_softness": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001,
+                    "tooltip": "Rampa suave no ponto preto (feather)."}),
+                "white_softness": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001,
+                    "tooltip": "Rampa suave no ponto branco (feather)."}),
+                "invert": ("BOOLEAN", {"default": False,
+                    "tooltip": "Inverte: o que está FORA do range vira sólido."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("rgba", "matte")
+    OUTPUT_NODE = True
+    FUNCTION = "run"
+    CATEGORY = "Bruxos do VFX/Key"
+
+    def run(self, images, channel, black_point, white_point, black_softness, white_softness, invert):
+        B, H, W, C = images.shape
+        rgba_list = []
+        matte_list = []
+
+        bp = float(black_point)
+        wp = float(white_point)
+        bs = float(black_softness)
+        ws = float(white_softness)
+
+        bp = min(bp, wp)
+        wp = max(bp, wp)
+        bs = min(bs, wp - bp)
+        ws = min(ws, wp - bp)
+
+        for i in range(B):
+            img = images[i]
+
+            if channel == "luminance":
+                val = 0.299 * img[..., 0] + 0.587 * img[..., 1] + 0.114 * img[..., 2]
+            elif channel == "red":
+                val = img[..., 0]
+            elif channel == "green":
+                val = img[..., 1]
+            else:
+                val = img[..., 2]
+
+            alpha = torch.zeros_like(val)
+            inside = (val >= bp) & (val <= wp)
+            alpha[inside] = 1.0
+
+            if bs > 0:
+                dark = (val >= bp) & (val < bp + bs)
+                alpha[dark] = (val[dark] - bp) / bs
+            if ws > 0:
+                light = (val > wp - ws) & (val <= wp)
+                alpha[light] = (wp - val[light]) / ws
+
+            alpha[val < bp] = 0.0
+            alpha[val > wp] = 0.0
+
+            if invert:
+                alpha = 1.0 - alpha
+
+            a = alpha.unsqueeze(-1)
+            rgba = torch.cat([img, a], dim=-1)
+            rgba_list.append(rgba)
+            matte_list.append(alpha)
+
+        rgba_out = torch.stack(rgba_list, dim=0)
+        matte_out = torch.stack(matte_list, dim=0)
+        return (rgba_out, matte_out)
+
+
+LyonirExtract.DESCRIPTION = (
+    "Lyonir Extract (Bruxos): keyer por range de luminância/cor. "
+    "Isola highlights/shadows e converte o resto em alpha. Equivalente ao Extract do DaVinci.\n"
+    "- channel: luminance, red, green, blue.\n"
+    "- black/white_point: limites do range.\n"
+    "- black/white_softness: feather nas bordas.\n"
+    "- invert: inverte a lógica.\n"
+    "SAÍDAS: rgba (IMAGE com alpha) e matte (MASK 0..1). "
+    "OUTPUT_NODE=True mostra o 1o frame no canvas; conecte 'rgba' em Preview Image "
+    "ou Video Helper Suite para ver o vídeo completo."
+)
 NODE_DISPLAY_NAME_MAPPINGS["BruxosBerniniMultiGuidance"] = "Bernini Multi-Guidance (Bruxos)"
 NODE_DISPLAY_NAME_MAPPINGS["BruxosFirstFrameExtract"] = "First-Frame CoT: Extrair (Bruxos)"
 NODE_DISPLAY_NAME_MAPPINGS["BruxosFirstFrameCompose"] = "First-Frame CoT: Compor (Bruxos)"
+NODE_CLASS_MAPPINGS["BruxosDepthMask"] = BruxosDepthMask
+NODE_CLASS_MAPPINGS["BruxosColorMatch"] = BruxosColorMatch
+NODE_CLASS_MAPPINGS["BruxosFrameInterpolator"] = BruxosFrameInterpolator
+NODE_CLASS_MAPPINGS["LyonirExtract"] = LyonirExtract
+
+NODE_DISPLAY_NAME_MAPPINGS["BruxosDepthMask"] = "Depth Mask DVD STANDALONE (Bruxos)"
+NODE_DISPLAY_NAME_MAPPINGS["BruxosColorMatch"] = "Color Match (Bruxos)"
+NODE_DISPLAY_NAME_MAPPINGS["BruxosFrameInterpolator"] = "Frame Interpolator (Bruxos)"
+NODE_DISPLAY_NAME_MAPPINGS["LyonirExtract"] = "Lyonir Extract (Bruxos)"

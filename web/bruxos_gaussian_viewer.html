@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Bruxos Gaussian Viewer</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --purple: #a855f7;
+      --purple2: #7c3aed;
+      --green: #4ade80;
+      --panel: rgba(13, 13, 18, .88);
+      --line: rgba(255,255,255,.13);
+    }
+    * { box-sizing: border-box; }
+    html, body { width:100%; height:100%; margin:0; overflow:hidden; background:#08080b; font:12px Inter,system-ui,sans-serif; }
+    #stage { position:absolute; inset:0; }
+    #stage canvas { display:block; width:100%; height:100%; }
+    #top {
+      position:absolute; z-index:5; top:8px; left:8px; right:8px;
+      display:flex; align-items:center; gap:6px; padding:6px;
+      border:1px solid var(--line); border-radius:10px; background:var(--panel);
+      backdrop-filter: blur(10px); box-shadow:0 7px 24px rgba(0,0,0,.35);
+    }
+    .brand { display:flex; align-items:center; gap:6px; margin-right:auto; font-weight:800; white-space:nowrap; }
+    .brand i { width:9px; height:9px; border-radius:50%; background:var(--purple); box-shadow:0 0 12px var(--purple); }
+    button, select, input {
+      height:27px; border:1px solid var(--line); border-radius:7px;
+      background:#181820; color:#eee; font:inherit;
+    }
+    button { padding:0 9px; cursor:pointer; font-weight:650; }
+    button:hover { border-color:var(--purple); }
+    button.primary { background:linear-gradient(135deg,var(--purple2),#9333ea); border-color:#b56bfa; }
+    label { display:flex; align-items:center; gap:4px; color:#bbb; }
+    input[type=range] { width:74px; accent-color:var(--purple); border:0; }
+    #status {
+      position:absolute; z-index:5; left:10px; bottom:10px; max-width:70%;
+      padding:6px 9px; border:1px solid var(--line); border-radius:8px;
+      color:#bbb; background:var(--panel); pointer-events:none;
+    }
+    #status.ok { color:var(--green); }
+    #status.err { color:#ff7878; }
+    #help {
+      display:none; position:absolute; z-index:7; inset:50% auto auto 50%;
+      transform:translate(-50%,-50%); width:min(390px,calc(100% - 30px));
+      padding:15px; border:1px solid #69408d; border-radius:12px;
+      background:#111118; color:#ccc; box-shadow:0 20px 70px #000;
+    }
+    #help.open { display:block; }
+    #help b { color:white; } #help p { margin:5px 0; line-height:1.45; }
+    #loading {
+      position:absolute; z-index:4; inset:0; display:grid; place-items:center;
+      color:#bbb; background:radial-gradient(circle,#16131d,#08080b 65%);
+    }
+    #loading.hidden { display:none; }
+    @media(max-width:700px) {
+      .brand span, label span { display:none; }
+      #top { flex-wrap:wrap; }
+    }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "@mkkellogg/gaussian-splats-3d": "https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="loading">Aguardando o PLY do SHARP…</div>
+  <div id="top">
+    <div class="brand"><i></i><span>Bruxos Gaussian</span></div>
+    <label><span>FOV</span><input id="fov" type="range" min="15" max="100" value="50"><output id="fovOut">50°</output></label>
+    <button id="home" title="Restaurar câmera">⌂</button>
+    <button id="camera" class="primary">Set Camera</button>
+    <button id="shot" title="Salvar screenshot no output">📷</button>
+    <button id="helpBtn" title="Ajuda">?</button>
+  </div>
+  <div id="status">Orbit: esquerdo · Pan: direito · Zoom: roda</div>
+  <div id="help">
+    <p><b>Controles</b></p>
+    <p>Mouse esquerdo: orbitar · direito: pan · roda: zoom.</p>
+    <p><b>Set Camera</b> grava posição, alvo e lente para o próximo render do node.</p>
+    <p><b>📷</b> salva uma captura rápida. A saída IMAGE de alta resolução é criada ao executar o node novamente.</p>
+    <button id="helpClose">Fechar</button>
+  </div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import * as GS from "@mkkellogg/gaussian-splats-3d";
+
+    const $ = (id) => document.getElementById(id);
+    const stage = $("stage"), status = $("status"), loading = $("loading");
+    let viewer = null, renderer = null, home = null, currentName = "";
+    let nativeW = 1920, nativeH = 1080;
+    let output = { resolution: 2048, aspectRatio: "source" };
+
+    function say(text, kind="") {
+      status.textContent = text;
+      status.className = kind;
+    }
+
+    function dispose() {
+      try { viewer?.stop?.(); viewer?.dispose?.(); } catch (_) {}
+      try { renderer?.dispose?.(); } catch (_) {}
+      stage.replaceChildren();
+      viewer = renderer = null;
+    }
+
+    function formatFor(name) {
+      const n = String(name || "").toLowerCase();
+      if (n.endsWith(".ksplat")) return GS.SceneFormat.KSplat;
+      if (n.endsWith(".splat")) return GS.SceneFormat.Splat;
+      return GS.SceneFormat.Ply;
+    }
+
+    function createViewer() {
+      renderer = new THREE.WebGLRenderer({
+        antialias: true, alpha: false, preserveDrawingBuffer: true,
+        powerPreference: "high-performance"
+      });
+      renderer.setClearColor(0x08080b, 1);
+      renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+      renderer.setSize(innerWidth, innerHeight);
+      stage.appendChild(renderer.domElement);
+      viewer = new GS.Viewer({
+        renderer,
+        cameraUp: [0, -1, 0],
+        initialCameraPosition: [0, 0, -5],
+        initialCameraLookAt: [0, 0, 0],
+        sharedMemoryForWorkers: !!crossOriginIsolated,
+        gpuAcceleratedSort: !!crossOriginIsolated,
+        antialiased: true,
+        halfPrecisionCovariancesOnGPU: true,
+        integerBasedSort: false,
+        splatSortDistanceMapPrecision: 24
+      });
+      viewer.start();
+    }
+
+    async function loadMesh(buffer, filename, extrinsics, intrinsics) {
+      dispose();
+      createViewer();
+      currentName = filename || "gaussian.ply";
+      if (intrinsics?.[0]?.[2] && intrinsics?.[1]?.[2]) {
+        nativeW = Math.round(intrinsics[0][2] * 2);
+        nativeH = Math.round(intrinsics[1][2] * 2);
+      }
+      const url = URL.createObjectURL(new Blob([buffer]));
+      loading.classList.remove("hidden");
+      loading.textContent = "Carregando " + currentName + "…";
+      try {
+        await viewer.addSplatScene(url, {
+          format: formatFor(currentName),
+          progressiveLoad: !currentName.toLowerCase().endsWith(".ksplat"),
+          showLoadingUI: false,
+          onProgress: (p) => loading.textContent = `Processando ${currentName}… ${Math.round(p || 0)}%`
+        });
+        if (intrinsics?.[1]?.[1]) {
+          const fov = 2 * Math.atan(nativeH / (2 * intrinsics[1][1])) * 180 / Math.PI;
+          setFov(fov);
+        }
+        home = {
+          pos: viewer.camera.position.clone(),
+          target: viewer.controls.target.clone(),
+          fov: viewer.camera.fov
+        };
+        loading.classList.add("hidden");
+        say(`${currentName} carregado · viewer WebEDIT/Bruxos`, "ok");
+        parent.postMessage({ type:"MESH_LOADED", filename:currentName, timestamp:Date.now() }, "*");
+      } catch (error) {
+        loading.classList.add("hidden");
+        say("Falha ao abrir PLY: " + error.message, "err");
+        parent.postMessage({ type:"MESH_ERROR", error:error.message, timestamp:Date.now() }, "*");
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    }
+
+    function setFov(value) {
+      const v = Math.max(15, Math.min(100, Number(value) || 50));
+      $("fov").value = v; $("fovOut").value = `${Math.round(v)}°`;
+      if (viewer?.camera) {
+        viewer.camera.fov = v;
+        viewer.camera.updateProjectionMatrix();
+      }
+    }
+
+    function cameraState() {
+      if (!viewer?.camera || !viewer?.controls) return null;
+      const cam = viewer.camera, target = viewer.controls.target;
+      const h = nativeH || renderer.domElement.height;
+      const fy = h / (2 * Math.tan(cam.fov * Math.PI / 360));
+      return {
+        position:{x:cam.position.x,y:cam.position.y,z:cam.position.z},
+        target:{x:target.x,y:target.y,z:target.z},
+        fx:fy, fy, roll:0, image_width:nativeW, image_height:nativeH,
+        scale:1, scale_compensation:1
+      };
+    }
+
+    function applyCamera(state) {
+      if (!state || !viewer?.camera || !viewer?.controls) return;
+      const p=state.position, t=state.target;
+      if (p) viewer.camera.position.set(+p.x||0,+p.y||0,+p.z||0);
+      if (t) viewer.controls.target.set(+t.x||0,+t.y||0,+t.z||0);
+      if (state.image_width) nativeW=+state.image_width;
+      if (state.image_height) nativeH=+state.image_height;
+      if (state.fy && nativeH) setFov(2*Math.atan(nativeH/(2*state.fy))*180/Math.PI);
+      viewer.controls.update?.();
+    }
+
+    function outputSize(resolution, ratio) {
+      let aspect = nativeW / nativeH;
+      if (ratio && ratio !== "source" && String(ratio).includes(":")) {
+        const [a,b] = String(ratio).split(":").map(Number);
+        if (a>0 && b>0) aspect=a/b;
+      }
+      const short = Math.max(256, Number(resolution)||2048);
+      return aspect >= 1
+        ? [Math.round(short*aspect), short]
+        : [short, Math.round(short/aspect)];
+    }
+
+    async function capture(requestId=null, resolution=null, ratio=null) {
+      if (!viewer?.camera || !renderer) throw new Error("viewer ainda não carregado");
+      const old = {
+        w:renderer.domElement.width, h:renderer.domElement.height,
+        aspect:viewer.camera.aspect, pixel:renderer.getPixelRatio()
+      };
+      const [w,h] = outputSize(resolution || output.resolution, ratio || output.aspectRatio);
+      renderer.setPixelRatio(1);
+      renderer.setSize(w,h,false);
+      viewer.camera.aspect=w/h;
+      viewer.camera.updateProjectionMatrix();
+      await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+      const image=renderer.domElement.toDataURL("image/png");
+      renderer.setPixelRatio(old.pixel);
+      renderer.setSize(innerWidth,innerHeight);
+      viewer.camera.aspect=innerWidth/innerHeight;
+      viewer.camera.updateProjectionMatrix();
+      if (requestId) parent.postMessage({type:"RENDER_RESULT",request_id:requestId,image,source:"bruxos_webedit",timestamp:Date.now()},"*");
+      else parent.postMessage({type:"SCREENSHOT_V2",image,timestamp:Date.now()},"*");
+      return image;
+    }
+
+    $("fov").addEventListener("input", e => setFov(e.target.value));
+    $("home").addEventListener("click", () => {
+      if (!home || !viewer) return;
+      viewer.camera.position.copy(home.pos); viewer.controls.target.copy(home.target);
+      setFov(home.fov); viewer.controls.update?.();
+    });
+    $("camera").addEventListener("click", () => {
+      const state=cameraState();
+      if (!state) return;
+      parent.postMessage({type:"SET_CAMERA_PARAMS",camera_state:state,timestamp:Date.now()},"*");
+      say("Câmera gravada para o render", "ok");
+    });
+    $("shot").addEventListener("click", () => capture().catch(e=>say(e.message,"err")));
+    $("helpBtn").addEventListener("click", () => $("help").classList.add("open"));
+    $("helpClose").addEventListener("click", () => $("help").classList.remove("open"));
+
+    addEventListener("resize", () => {
+      if (!renderer || !viewer?.camera) return;
+      renderer.setSize(innerWidth,innerHeight);
+      viewer.camera.aspect=innerWidth/innerHeight;
+      viewer.camera.updateProjectionMatrix();
+    });
+    addEventListener("message", async (event) => {
+      const d=event.data||{};
+      if (d.type==="LOAD_MESH_DATA" && d.data) await loadMesh(d.data,d.filename,d.extrinsics,d.intrinsics);
+      else if (d.type==="APPLY_CAMERA_STATE") applyCamera(d.camera_state);
+      else if (d.type==="OUTPUT_SETTINGS") output={resolution:d.output_resolution||2048,aspectRatio:d.output_aspect_ratio||"source"};
+      else if (d.type==="RENDER_REQUEST" && d.request_id) {
+        try { await capture(d.request_id,d.output_resolution,d.output_aspect_ratio); }
+        catch(e) { parent.postMessage({type:"RENDER_ERROR",request_id:d.request_id,error:e.message,source:"bruxos_webedit"},"*"); }
+      }
+    });
+  </script>
+</body>
+</html>
