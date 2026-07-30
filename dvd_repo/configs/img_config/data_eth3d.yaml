@@ -1,0 +1,11 @@
+name: eth3d
+disp_name: eth3d_full
+# dataset_dir: eth3d
+# dir: eth3d/eth3d.tar
+# filename_ls_path: data_split/eth3d/eth3d_filename_list.txt
+dir: eth3d
+# dir: eth3d/eth3d.tar
+filename: data_split/eth3d/eth3d_filename_list.txt
+resize_to_hw: [480, 720]
+# processing_res: 768
+# alignment_max_res: 1024

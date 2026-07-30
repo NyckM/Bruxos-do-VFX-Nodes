@@ -1,0 +1,90 @@
+# model:
+model_id_with_origin_paths: "Wan-AI/Wan2.1-T2V-1.3B:diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.1-T2V-1.3B:Wan2.1_VAE.pth"
+
+# Models
+trainable_models: "dit"
+remove_prefix_in_ckpt: "pipe.dit"
+mode: regression
+denoise_step: 0.5 
+training_target: "x"
+
+lora_base_model: "dit"
+lora_rank: 512
+
+# Loss
+grad_loss: true
+grad_co: 0.5
+use_latent_flow: true
+
+# Load and save
+resume: false
+training_state_dir: "na"
+load_optimizer: false
+output_path: "your_exp_ckpt_save_path"
+global_step: 0
+
+# train:
+num_epochs: 1000000
+gradient_accumulation_steps: 4
+validate_step: 100
+init_validate: true
+
+# Hyperparam:
+clip_grad_norm: true
+learning_rate: 1e-4
+use_gradient_checkpointing: true
+log_step: 10
+no_extra_frame: true
+warmup_steps: 0
+mixed_precision: "bf16"
+train_all: false
+
+# validate
+denoise_strength: 1
+validation_scheduler_timesteps: 1
+
+# dataset:
+dataloader_num_workers: 4
+train_ratio: 1
+
+# 2 : 6 
+prob: [9, 1, 40, 10]
+batch_size: 8
+
+# Image
+# hypersim_dataset:
+train_data_dir_hypersim: "your_hypersim_dir"
+resolution_hypersim: [480, 640]
+random_flip: true
+norm_type: "trunc_disparity"
+truncnorm_min: 0.02
+align_cam_normal: false
+
+# vkitti
+train_data_dir_vkitti: 'your_vkitti_dir'
+
+# Video
+max_num_frame: 45
+min_num_frame: 45
+max_sample_stride: 1
+min_sample_stride: 1
+
+train_data_dir_ttr_vid: "your_tttr_dir"
+train_data_dir_vkitti_vid: 'your_vkitti_dir'
+
+# test_set
+test_batch_size: 1
+test_max_num_frame: 45
+test_min_num_frame: 45
+test_max_sample_stride: 1
+test_min_sample_stride: 1
+
+kitti_vid_test_data_root: "your_kitti_depth_dir"
+scannet_vid_test_data_root: 'your_scannet_dir'
+scannet_split_ls: 'configs/scannetv1_test.txt'
+nyuv2_test_data_root: 'your_nyuv2_dir'
+
+# Unique setting
+scheduler_training_weight_type: "equal" # late, equal, default
+training_schedule_mode: "default" # cosine, linear, default
+training_scheduler_timesteps: 1

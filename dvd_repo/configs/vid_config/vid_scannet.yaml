@@ -1,0 +1,3 @@
+name: scannet
+dir: scannet
+split_ls: 'configs/scannetv1_test.txt'

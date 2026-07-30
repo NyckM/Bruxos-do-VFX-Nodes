@@ -1,0 +1,6 @@
+name: scannet
+disp_name: scannet_val_800_1
+# dataset_dir: scannet
+# filename_ls_path: data_split/scannet/scannet_val_sampled_list_800_1.txt
+dir: scannet
+filename: data_split/scannet/scannet_val_sampled_list_800_1.txt

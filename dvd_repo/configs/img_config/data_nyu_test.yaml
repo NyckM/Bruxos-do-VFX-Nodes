@@ -1,0 +1,8 @@
+name: nyu_v2
+disp_name: nyu_test_full
+# dataset_dir: nyuv2
+# filename_ls_path: data_split/nyu/labeled/filename_list_test.txt
+eigen_valid_mask: true
+
+dir: nyuv2
+filename: data_split/nyu/labeled/filename_list_test.txt

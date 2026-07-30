@@ -1,0 +1,8 @@
+name: diode
+disp_name: diode_val_all
+# dir: diode
+# dataset_dir: diode
+# filename_ls_path: data_split/diode/diode_val_all_filename_list.txt 
+processing_res: 640
+dir: diode
+filename: data_split/diode/diode_val_all_filename_list.txt 

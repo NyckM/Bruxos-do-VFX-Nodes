@@ -1,0 +1,8 @@
+name: kitti
+disp_name: kitti_eigen_test_full
+# dataset_dir: kitti
+# filename_ls_path: data_split/kitti/eigen_test_files_with_gt.txt
+kitti_bm_crop: true
+valid_mask_crop: eigen
+dir: kitti
+filename: data_split/kitti/eigen_test_files_with_gt.txt
