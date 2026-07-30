@@ -34,3 +34,18 @@ pyyaml
 # transformers>=4.45
 # accelerate
 # pillow
+
+# --- DepthMask DVD (BruxosDepthMask) — mesmas deps do comfy-dvd padrao ---
+#     (VAE nao e mais necessario aqui; o node usa o dvd_repo internamente)
+omegaconf>=2.3.0
+peft>=0.18.0
+accelerate>=1.9.0
+safetensors
+sentencepiece
+matplotlib
+modelscope
+pandas
+imageio[ffmpeg]
+# FlashAttention nao entra aqui: e especifico de CUDA/torch/python e tem
+# instalador proprio (Add-ons\FlashAttention.bat no ComfyUI-Easy-Install).
+# O install.bat/install.sh so avisam se ela estiver faltando.

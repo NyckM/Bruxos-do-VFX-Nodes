@@ -220,7 +220,13 @@ class BruxosBerniniInfinityTiled:
                           chunk_size, overlap_frames, mask_grow, mask_blur,
                           limpar_vram, monitor_memoria, bbox_compose,
                           reference_video, **kwargs):
-        """Roda o Bernini no bbox da mascara DENTRO do tile — duplo recorte."""
+        """Roda o Bernini no bbox da mascara DENTRO do tile — duplo recorte.
+
+        Para evitar borda de cor/textura, o modelo recebe o bbox EXPANDIDO com
+        uma janela de contexto do fundo ao redor (ctx_pad). O Bernini gera nessa
+        area maior (ve o fundo externo e casa a textura), mas na composicao final
+        so colamos de volta a regiao da MASCARA — o fundo externo e descartado.
+        """
         if _bx_mask_bbox is None:
             raise RuntimeError("[Bernini Tiled][bbox] helpers do nodes.py nao importaram.")
 
@@ -228,19 +234,41 @@ class BruxosBerniniInfinityTiled:
         x0, y0, x1, y1 = _bx_mask_bbox(m_tile, int(mask_grow), 16, tw, th)
         cw, ch = x1 - x0, y1 - y0
         area_pct = 100.0 * (cw * ch) / (tw * th)
-        print(f"[Bernini Tiled][bbox] regiao no tile: ({x0},{y0})-({x1},{y1}) "
-              f"{cw}x{ch} (~{area_pct:.0f}% do tile {tw}x{th})", flush=True)
 
-        # fonte e mascara recortadas no bbox
-        src_crop = src_tile[:, y0:y1, x0:x1, :].contiguous()
-        m_crop   = m_tile[:, y0:y1, x0:x1].contiguous()
+        # janela de CONTEXTO ao redor do bbox: o modelo ve o fundo externo e
+        # casa a textura/cor — elimina a borda. ctx_pad = metade do tile_overlap
+        # (ja existe sobreposicao com vizinhos, reusar a mesma logica faz sentido).
+        ctx_pad = max(64, int(mask_blur) * 4)   # pelo menos 64px de contexto
+        cx0 = max(0,  x0 - ctx_pad)
+        cy0 = max(0,  y0 - ctx_pad)
+        cx1 = min(tw, x1 + ctx_pad)
+        cy1 = min(th, y1 + ctx_pad)
+        # alinha ao multiplo de 16
+        cx0 = (cx0 // 16) * 16
+        cy0 = (cy0 // 16) * 16
+        cx1 = min(tw, -(-cx1 // 16) * 16)
+        cy1 = min(th, -(-cy1 // 16) * 16)
+        ccw, cch = cx1 - cx0, cy1 - cy0
 
-        # roda o Bernini no bbox (resolucao menor)
+        print(f"[Bernini Tiled][bbox] mascara: ({x0},{y0})-({x1},{y1}) {cw}x{ch} "
+              f"(~{area_pct:.0f}% do tile) | contexto: ({cx0},{cy0})-({cx1},{cy1}) "
+              f"{ccw}x{cch} (ctx_pad={ctx_pad}px)", flush=True)
+
+        # fonte e mascara na janela de CONTEXTO (maior que o bbox puro)
+        src_ctx  = src_tile[:, cy0:cy1, cx0:cx1, :].contiguous()
+        # mascara no contexto: so a area original da mascara, nao o contexto externo
+        m_ctx = torch.zeros((T, cch, ccw), dtype=torch.float32)
+        # posicao da mascara dentro da janela de contexto
+        my0, my1 = y0 - cy0, y1 - cy0
+        mx0, mx1 = x0 - cx0, x1 - cx0
+        m_ctx[:, my0:my1, mx0:mx1] = m_tile[:, y0:y1, x0:x1]
+
+        # roda o Bernini na janela de contexto (modelo ve o fundo e casa a cor)
         bern = _BERNINI()
         imgs, _, _ = bern.render(
             positive=positive, negative=negative,
             high_model=high_model, low_model=low_model, vae=vae,
-            source_video=src_crop, width=cw, height=ch,
+            source_video=src_ctx, width=ccw, height=cch,
             seed=int(seed), steps=int(steps), split_step=int(split_step),
             cfg=float(cfg), sampler_name=sampler_name, scheduler=scheduler,
             denoise=float(denoise),
@@ -252,20 +280,24 @@ class BruxosBerniniInfinityTiled:
             mask_pad=0, bbox_compose="rectangle", resize_mode="stretch",
             limpar_vram=limpar_vram, monitor_memoria=bool(monitor_memoria),
             guidance_mode="off",
-            region_mask=m_crop, reference_video=reference_video,
+            region_mask=m_ctx, reference_video=reference_video,
             **kwargs,
         )
-        crop_imgs = imgs.float().clamp(0, 1)
-        n = min(T, int(crop_imgs.shape[0]))
+        ctx_imgs = imgs.float().clamp(0, 1)
+        n = min(T, int(ctx_imgs.shape[0]))
 
-        # cola de volta no tile completo
+        # cola de volta NO TILE: so a area da MASCARA (nao o contexto externo)
+        # o fundo externo gerado e descartado — so serve pra guiar a cor/textura
         out = src_tile.clone()
+        m_orig = m_tile[:n, y0:y1, x0:x1]   # mascara original (sem grow)
         if bbox_compose == "rectangle":
             blend = _bx_rect_feather(n, ch, cw, int(mask_blur)).unsqueeze(-1)
         else:
-            blend = m_crop[:n].unsqueeze(-1)
+            blend = m_orig.unsqueeze(-1)
+        # extrai so a area da mascara do resultado do contexto
+        result_crop = ctx_imgs[:n, my0:my1, mx0:mx1, :]
         region = out[:n, y0:y1, x0:x1, :]
-        out[:n, y0:y1, x0:x1, :] = region * (1.0 - blend) + crop_imgs[:n] * blend
+        out[:n, y0:y1, x0:x1, :] = region * (1.0 - blend) + result_crop * blend
         return out.cpu()
 
     # ------------------------------------------------------------------ main

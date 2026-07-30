@@ -146,6 +146,8 @@ class BruxosBerniniI2V:
                 "teacache": ("BERNINI_TEACACHE", {"tooltip": "[experimental] Ligue a saida do node 'Bernini TeaCache (Bruxos)' aqui pra acelerar (1.5-2x) pulando blocos do transformer. So age com guidance_mode=off. Sem ligar = desligado. Teste com/sem e compare qualidade."}),
                 "guidance_mode": (["off", "multi", "tiled"], {"default": "off", "tooltip": "off = CFG normal (rapido). multi = guidance por stream (eq. 8-12) — LIGA 'reference_strength' pra FORCAR a referencia (~4x mais lento). tiled = LADRILHO no latente (igual ao Bernini Infinity). ATENCAO: o tiled se DESLIGA sozinho quando ha referencia (context_latents), que o i2v SEMPRE tem — entao no i2v ele so avisa e roda normal (nao tila). So tila de verdade em T2V puro (sem referencia). Exposto aqui pra ficar igual ao Infinity e voce testar."}),
                 "reference_strength": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 30.0, "step": 0.05, "tooltip": "[guidance_mode=multi] Quanto FORCA a imagem de referencia. Maior = mais preso a ela (identidade/roupa/estilo). Paper: 1.25 (base) ate 3.0 (RV2V, referencia forte). Comece em 1.5-2.5. So tem efeito com guidance_mode=multi. Aplica aos dois streams de referencia (1a ref + refs extras)."}),
+                "ref_influence_vid_off": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 8.0, "step": 0.05, "tooltip": "[guidance_mode=off/tiled] Controla a influencia do VIDEO de referencia (reference_video) SEM o modo multi (4x mais lento) -- escala a magnitude do latente antes de virar contexto. 1.0 = neutro. Independente de ref_influence_img_off: suba um e desca o outro pra pender mais pro video ou mais pras imagens. EXPERIMENTAL -- comece em 1.5-2.5; 5+ tende a quebrar a imagem. Sem efeito no modo multi (la manda reference_strength)."}),
+                "ref_influence_img_off": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 8.0, "step": 0.05, "tooltip": "[guidance_mode=off/tiled] Controla a influencia das IMAGENS de referencia SEM o modo multi -- escala a magnitude do latente de cada imagem antes de virar contexto. 1.0 = neutro. Pra 'parecer mais com as imagens': suba este. Pra 'parecer mais com o video de referencia': suba o ref_influence_vid_off e desca este. EXPERIMENTAL -- comece em 1.5-2.5; 5+ tende a quebrar a imagem. Sem efeito no modo multi (la manda reference_strength)."}),
                 "tile_w": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1, "tooltip": "[guidance_mode=tiled] Colunas de ladrilho. 1 = nao corta na horizontal. So faz efeito com tiled E sem referencia (T2V)."}),
                 "tile_h": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1, "tooltip": "[guidance_mode=tiled] Linhas de ladrilho. So faz efeito com tiled E sem referencia (T2V)."}),
                 "tile_overlap": ("INT", {"default": 8, "min": 1, "max": 64, "step": 1, "tooltip": "[guidance_mode=tiled] Sobreposicao entre ladrilhos, em latentes (1 ~ 8px)."}),
@@ -186,6 +188,7 @@ class BruxosBerniniI2V:
                  reference_image_5=None, reference_image_6=None, reference_image_7=None,
                  reference_image_8=None, reference_video=None, teacache=None,
                  guidance_mode="off", reference_strength=1.5,
+                 ref_influence_vid_off=1.0, ref_influence_img_off=1.0,
                  tile_w=2, tile_h=2, tile_overlap=8, mode="context_window",
                  chunk_size=0, overlap=8, ref_max_size=1280,
                  limpar_vram="leve", force_unload_between_passes=False, monitor_memoria=False,
@@ -216,9 +219,17 @@ class BruxosBerniniI2V:
                 refs[f"reference_image_{idx}"] = img
                 idx += 1
 
+        # ref_influence_vid_off/img_off so valem fora do multi (la quem manda e
+        # reference_strength via CFG multi-stream) -- ficam neutros (1.0) em multi
+        # pra nao dobrar o efeito.
+        _eff_mode = guidance_mode if guidance_mode in ("multi", "tiled") else "off"
+        _ref_scale_vid = float(ref_influence_vid_off) if _eff_mode != "multi" else 1.0
+        _ref_scale_img = float(ref_influence_img_off) if _eff_mode != "multi" else 1.0
+
         context_latents = list(_bx_collect_ref(
             vae, int(aligned), int(ref_max_size),
             reference_video=reference_video, reference_images=refs,
+            scale_vid=_ref_scale_vid, scale_img=_ref_scale_img,
         ))
         # avisos (NAO travam nada — so orientam; roda do jeito que voce pediu)
         n_ref_imgs = len(refs)

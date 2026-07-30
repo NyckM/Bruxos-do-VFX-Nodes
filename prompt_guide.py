@@ -232,6 +232,8 @@ class BruxosPromptGuide:
             },
             "optional": {
                 "clip": ("CLIP", {"tooltip": "CLIP/encoder do modelo. Se ligado, sai CONDITIONING; senao, so os textos."}),
+                "prompt_in": ("STRING", {"forceInput": True,
+                          "tooltip": "Entrada de fio pronta pra ligar direto (ex.: enhanced_prompt do Bernini Prompt Enhancer), sem precisar converter o campo 'prompt' pra input manualmente. Se ligado, SUBSTITUI o texto do campo 'prompt' abaixo."}),
                 "prepend_system": ("BOOLEAN", {"default": True,
                           "tooltip": "Coloca o system prompt antes da sua instrucao no positivo."}),
                 "system_prompt": ("STRING", {"multiline": True, "default": "",
@@ -260,14 +262,18 @@ class BruxosPromptGuide:
     )
 
     def build(self, model, task, negative_preset, prompt,
-              clip=None, prepend_system=True, system_prompt="", negative_prompt=""):
+              clip=None, prompt_in=None, prepend_system=True, system_prompt="", negative_prompt=""):
         mp = PRESETS.get(model, PRESETS[MODELS[0]])
 
         sys_text = (system_prompt or "").strip()
         if not sys_text:
             sys_text = mp["tasks"].get(task, mp["tasks"].get("Default", "")).strip()
 
-        user_text = (prompt or "").strip()
+        _in = (prompt_in or "").strip()
+        user_text = _in or (prompt or "").strip()
+        _src = "prompt_in (conectado)" if _in else "prompt (widget)"
+        _prev = (user_text[:150] + "...") if len(user_text) > 150 else user_text
+        print(f"[Prompt Guide (Bruxos)] fonte usada: {_src} | texto: {_prev!r}", flush=True)
         if prepend_system and sys_text:
             positive_text = f"{sys_text}\n\n{user_text}".strip()
         else:
@@ -283,7 +289,20 @@ class BruxosPromptGuide:
         pos_cond = _encode(clip, positive_text) if clip is not None else None
         neg_cond = _encode(clip, neg_text) if clip is not None else None
         if clip is None:
-            logging.info("[BruxosPromptGuide] sem CLIP: retornando apenas os textos.")
+            # AVISO FORTE: sem CLIP as saidas positive/negative saem None. Quem
+            # ligar elas num sampler/Bernini vai quebrar la na frente com um
+            # "'NoneType' object is not iterable" que nao explica nada. Entao
+            # gritamos aqui, onde o problema realmente esta.
+            print(
+                "[Prompt Guide (Bruxos)] ATENCAO: a entrada 'clip' NAO esta ligada.\n"
+                "[Prompt Guide (Bruxos)]   -> as saidas 'positive' e 'negative' saem VAZIAS (None);\n"
+                "[Prompt Guide (Bruxos)]      so 'positive_text'/'negative_text' tem conteudo.\n"
+                "[Prompt Guide (Bruxos)]   -> se voce ligou 'positive'/'negative' num sampler ou no "
+                "Bernini Infinity, ele VAI FALHAR.\n"
+                "[Prompt Guide (Bruxos)]   Conserto: ligue um CLIP (CLIPLoader/CLIPLoaderGGUF) na entrada "
+                "'clip' deste node.",
+                flush=True,
+            )
         return (pos_cond, neg_cond, positive_text, neg_text)
 
 

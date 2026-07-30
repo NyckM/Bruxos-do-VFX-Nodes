@@ -3,6 +3,20 @@ import gc
 import math
 
 import torch
+import torch.nn.functional as F
+
+# numpy e cv2 sao usados por varios nodes deste arquivo pelos nomes curtos
+# (np / cv2). Sem estes imports o modulo levanta NameError em tempo de
+# execucao (ex.: BruxosFrameInterpolator, BruxosColorMatch).
+try:
+    import numpy as np
+except Exception:  # pragma: no cover
+    np = None
+
+try:
+    import cv2
+except Exception:  # pragma: no cover
+    cv2 = None
 
 import comfy.model_management
 import comfy.samplers
@@ -427,11 +441,17 @@ def _mask_bbox(m, pad, stride, W, H, thr=0.02):
     return x0, y0, x1, y1
 
 
-def _collect_reference_latents(vae, length, ref_max_size, reference_video=None, reference_images=None):
+def _collect_reference_latents(vae, length, ref_max_size, reference_video=None, reference_images=None,
+                                scale_vid=1.0, scale_img=1.0):
     latents = []
     if reference_video is not None:
         ref_vid = _resize_long_edge(reference_video[:length], ref_max_size)
-        latents.append(_encode_video(vae, ref_vid[:, :, :, :3]))
+        vid_latent = _encode_video(vae, ref_vid[:, :, :, :3])
+        # scale_vid ajusta a influencia do VIDEO de referencia, fora do modo multi
+        # (ver ref_influence_vid_off no BerniniInfinity.render). 1.0 = sem mudanca.
+        if scale_vid != 1.0:
+            vid_latent = vid_latent * scale_vid
+        latents.append(vid_latent)
 
     if reference_images:
         for name in sorted(reference_images):
@@ -440,7 +460,13 @@ def _collect_reference_latents(vae, length, ref_max_size, reference_video=None, 
                 continue
             for i in range(imgs.shape[0]):
                 img = _resize_long_edge(imgs[i:i + 1], ref_max_size)
-                latents.append(_encode_video(vae, img[:, :, :, :3]))
+                img_latent = _encode_video(vae, img[:, :, :, :3])
+                # scale_img ajusta a influencia das IMAGENS de referencia, fora do
+                # modo multi (ver ref_influence_img_off no BerniniInfinity.render).
+                if scale_img != 1.0:
+                    img_latent = img_latent * scale_img
+                latents.append(img_latent)
+
     return latents
 
 
@@ -914,22 +940,63 @@ class BerniniInfinity:
                 "limpar_vram": (["off", "leve", "agressivo"], {"default": "leve", "tooltip": "Limpeza de VRAM entre os passos high/low e entre os blocos de frames, pra rodar resolucoes maiores e videos longos sem entupir a GPU. off = nada (legado). leve = gc + esvazia cache da VRAM (barato, recomendado). agressivo = tambem DESCARREGA os modelos entre os passos (high e low nunca ficam juntos na VRAM = menor pico), porem recarrega o modelo a cada troca (mais lento). Use agressivo so se estourar VRAM em resolucao alta."}),
                 "force_unload_between_passes": ("BOOLEAN", {"default": False, "tooltip": "[anti-OOM] Descarrega o modelo HIGH da VRAM ANTES de comecar o LOW, IGNORANDO o guard de LoRA. Ligue se der OOM exatamente quando o passo LOW comeca -- e o sinal de que os dois modelos (high+low) nao cabem juntos na placa (ex.: INT8 14B ~14GB cada numa placa de 22GB). Custa um re-stage por passo (mais lento), mas evita o pico. Deixe DESLIGADO se voce NAO esta com OOM."}),
                 "monitor_memoria": ("BOOLEAN", {"default": False, "tooltip": "Imprime no console o uso de RAM e VRAM em tempo real (inicio, entre high/low, por bloco e no fim). Use pra diagnosticar onde a memoria enche. Precisa de CUDA (VRAM) e psutil (RAM); o que faltar aparece em branco."}),
-                "guidance_mode": (["off", "multi", "tiled"], {"default": "off", "tooltip": "off = CFG unico normal (recomendado). multi = guidance por stream (eq. 8-12; experimental, ~4x mais lento). tiled = LADRILHO: divide o quadro em tile_w x tile_h e funde a cada passo de denoise -> RESOLUCOES MAIORES sem estourar a VRAM (o modelo so ve um pedaco por vez), sem emenda nem drift. tiled custa mais tempo (varias predicoes por passo), nao qualidade."}),
+                "guidance_mode": (["off", "multi", "tiled", "auto", "rv2v", "v2v", "v2v_chain", "t2v",
+                                   "v2v_apg", "t2v_apg", "r2v_apg"], {"default": "off", "tooltip":
+                    "off = CFG unico normal (1-2 forwards/step, recomendado pra velocidade).\n"
+                    "tiled = LADRILHO: divide o quadro em tile_w x tile_h e funde a cada passo -> resolucoes maiores sem estourar VRAM.\n"
+                    "--- modos de guidance por STREAM (custo = n de forwards por passo) ---\n"
+                    "auto = escolhe o mais barato que cobre os streams ligados (recomendado se for usar stream).\n"
+                    "v2v (2 fwd) = 1 CFG de texto vendo video+refs juntos. O MAIS BARATO com contexto.\n"
+                    "t2v (2 fwd) = texto puro, sem contexto.\n"
+                    "v2v_chain (3 fwd) = separa a adesao ao VIDEO (w_vid) da do texto (w_txt). Meio-termo.\n"
+                    "rv2v (4 fwd) = separa video, refs e texto (w_vid/w_img/w_txt). O antigo 'multi'. Mais caro, mais controle.\n"
+                    "v2v_apg / t2v_apg (2 fwd) e r2v_apg (3 fwd) = versoes com APG (projecao ortogonal + eta), que "
+                    "reduzem saturacao/queimado em guidance alto. Veja apg_eta.\n"
+                    "'multi' (legado) = apelido de rv2v, mantido pra workflows antigos."}),
                 "tile_w": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1, "tooltip": "[tiled] Colunas de ladrilho. 1 = nao corta na horizontal."}),
                 "tile_h": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1, "tooltip": "[tiled] Linhas de ladrilho. 2x2 = 4 pedacos. Suba (3x3, 4x4) se ainda estourar a VRAM."}),
                 "tile_overlap": ("INT", {"default": 8, "min": 1, "max": 64, "step": 1, "tooltip": "[tiled] Sobreposicao entre ladrilhos, em latentes (1 ~ 8px no Wan). Maior = costura mais suave e um pouco mais de VRAM."}),
                 "w_vid": ("FLOAT", {"default": 1.25, "min": 0.0, "max": 30.0, "step": 0.05, "tooltip": "[guidance_mode=multi] Peso da adesao ao VIDEO-fonte. Maior = mais fiel ao original; menor = mais liberdade pra editar. Paper: 1.25 (V2V/RV2V)."}),
                 "w_img": ("FLOAT", {"default": 1.25, "min": 0.0, "max": 30.0, "step": 0.05, "tooltip": "[guidance_mode=multi] Peso das IMAGENS/refs. Em RV2V pese mais (paper: 3.0). So tem efeito se houver reference_images/reference_video."}),
+                "ref_influence_vid_off": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 8.0, "step": 0.05, "tooltip": "[guidance_mode=off/tiled] Controla a influencia do VIDEO de referencia (reference_video) SEM precisar do modo multi (4x mais lento, inviavel em GPUs mais limitadas) -- escala a magnitude do latente do video de referencia antes de virar contexto. 1.0 = neutro. Menor = mais parecido com o source_video (fiel ao original); maior = mais parecido com o video de referencia. Independente de ref_influence_img_off -- suba um e desca o outro pra pender pra imagem ou pra video. E EXPERIMENTAL -- comece testando 1.5-2.5 e va subindo aos poucos; valores muito altos (5+) tendem a quebrar a imagem (artefatos/saturacao). Sem efeito no modo multi (la quem manda e w_vid)."}),
+                "ref_influence_img_off": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 8.0, "step": 0.05, "tooltip": "[guidance_mode=off/tiled] Controla a influencia das IMAGENS de referencia (reference_images) SEM precisar do modo multi -- escala a magnitude do latente de cada imagem de referencia antes de virar contexto. 1.0 = neutro. Menor = as imagens pesam menos (o resultado puxa mais pro source_video/video de referencia); maior = puxa mais pra aparencia/material das imagens. Pra 'parecer mais com as imagens e menos com o video': suba este e desca o ref_influence_vid_off. E EXPERIMENTAL -- comece testando 1.5-2.5; valores muito altos (5+) tendem a quebrar a imagem. Sem efeito no modo multi (la quem manda e w_img)."}),
                 "region_mask": ("MASK,IMAGE", {"tooltip": "Mascara da regiao a gerar (branco/colorido = gera, preto = mantem a fonte). Aceita MASK ou IMAGE colorida -- pode ligar direto o pose_video_mask/reference_image_mask do 'Create SCAIL-2 Colored Mask'. Use com mask_mode = inpaint ou bbox."}),
                 "reference_video": ("IMAGE", {"tooltip": "Video de referencia opcional (ex.: clean plate / identidade). Vira latente de contexto extra pra guiar a geracao. Nao precisa ter o mesmo tamanho do source."}),
-                "reference_images.reference_image_0": ("IMAGE", {"tooltip": "Imagem de referencia 0 (ex.: rosto/objeto a preservar). Vira contexto extra. Pode deixar vazio."}),
-                "reference_images.reference_image_1": ("IMAGE", {"tooltip": "Imagem de referencia 1 (opcional)."}),
+                "reference_images.reference_image_0": ("IMAGE", {"tooltip":
+                    "Imagem de referencia 0 (ex.: rosto/objeto a preservar). Vira contexto extra.\n"
+                    "IMPORTANTE -- no PROMPT cite ela como 'from image0' (ex.: 'Replace the man with the old man from image0'). "
+                    "Esse e o formato LITERAL em que o Bernini foi treinado; 'reference_image_0', 'a primeira referencia' ou "
+                    "qualquer parafrase NAO funciona. Preencha os slots EM ORDEM a partir do 0 -- se pular, eles sao compactados "
+                    "internamente e o numero deixa de bater com o marcador do prompt. O video-fonte e implicito: nao cite ele."}),
+                "reference_images.reference_image_1": ("IMAGE", {"tooltip": "Imagem de referencia 1 (opcional). No prompt: 'from image1'."}),
                 "reference_images.reference_image_2": ("IMAGE", {"tooltip": "Imagem de referencia 2 (opcional)."}),
                 "reference_images.reference_image_3": ("IMAGE", {"tooltip": "Imagem de referencia 3 (opcional)."}),
                 "reference_images.reference_image_4": ("IMAGE", {"tooltip": "Imagem de referencia 4 (opcional)."}),
                 "reference_images.reference_image_5": ("IMAGE", {"tooltip": "Imagem de referencia 5 (opcional)."}),
                 "reference_images.reference_image_6": ("IMAGE", {"tooltip": "Imagem de referencia 6 (opcional)."}),
                 "reference_images.reference_image_7": ("IMAGE", {"tooltip": "Imagem de referencia 7 (opcional)."}),
+                # --- APPEND-ONLY: widgets novos SEMPRE no fim do bloco. O ComfyUI
+                # mapeia os widgets_values salvos por ORDEM; inserir no meio desloca
+                # os valores de todos os workflows ja salvos. ---
+                "apg_eta": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip":
+                    "[modos *_apg] Peso da componente PARALELA na projecao APG. 1.0 = igual ao CFG normal (neutro, sem efeito). "
+                    "Menor suprime a parte do delta que causa SATURACAO/QUEIMADO em guidance alto, mantendo a parte ortogonal "
+                    "que de fato muda o conteudo. 0.5 = valor canonico do Bernini (ByteDance); 0.15 = valor do BerniniRWrapper "
+                    "(mais agressivo). So tem efeito nos modos terminados em _apg."}),
+                "apg_momentum": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.05, "tooltip":
+                    "[modos *_apg] Media movel (EMA) do delta entre os passos de denoise. 0.0 = off (padrao do Bernini). "
+                    "Positivo acumula a direcao dos passos anteriores (movimento mais suave); negativo amortece. Experimental."}),
+                "apg_norm_threshold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 500.0, "step": 1.0, "tooltip":
+                    "[modos *_apg] Teto da norma do delta antes da projecao (clamp). 0 = sem limite. O Bernini usa 50.0. "
+                    "Evita que um passo isolado com delta gigante estoure a imagem."}),
+                "omega_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip":
+                    "Multiplica w_vid/w_img/w_txt UMA vez quando o sampler troca do high_model pro low_model (split_step). "
+                    "1.0 = neutro (comportamento antigo). O Bernini usa 0.8: reduz a forca da guidance no regime de baixo ruido, "
+                    "onde ela tende a endurecer textura/contraste. Vale pros modos de stream E pro CFG normal."}),
+                "apg_rescale": ("BOOLEAN", {"default": False, "tooltip":
+                    "[modos *_apg] Renormaliza o resultado pra ter a mesma magnitude da predicao condicional. A projecao APG "
+                    "ENCOLHE o resultado; sem esse rescale a imagem tende a sair lavada/sem contraste em guidance alto. "
+                    "O BerniniRWrapper deixa LIGADO por padrao. Aqui vem desligado (neutro); ligue junto com apg_eta baixo."}),
             },
         }
 
@@ -988,17 +1055,65 @@ class BerniniInfinity:
         guidance_mode="off",
         w_vid=1.25,
         w_img=1.25,
+        ref_influence_vid_off=1.0,
+        ref_influence_img_off=1.0,
         tile_w=2,
         tile_h=2,
         tile_overlap=8,
         region_mask=None,
         reference_video=None,
+        apg_eta=0.5,
+        apg_momentum=0.0,
+        apg_norm_threshold=0.0,
+        omega_scale=1.0,
+        apg_rescale=False,
         **kwargs,
     ):
-        # guidance: 'off' = CFG unico (padrao). 'multi' = por stream. 'tiled' = ladrilho.
-        self._g_mode = guidance_mode if guidance_mode in ("multi", "tiled") else "off"
+        # guidance: 'off' = CFG unico (padrao). 'tiled' = ladrilho. Os demais sao
+        # modos de guidance por STREAM (2 a 4 forwards por passo).
+        _BX_STREAM_MODES = ("auto", "rv2v", "v2v", "v2v_chain", "t2v",
+                            "v2v_apg", "t2v_apg", "r2v_apg")
+        # ---------------------------------------------------------------
+        # VALIDACAO: positive/negative TEM que ser CONDITIONING de verdade.
+        # Erro classico: o 'Prompt Guide (Bruxos)' SEM a entrada 'clip' ligada
+        # devolve None nas saidas positive/negative (ele so consegue montar o
+        # CONDITIONING se tiver o CLIP pra codificar o texto). Ligar esse None
+        # aqui rebentava la dentro com "'NoneType' object is not iterable",
+        # sem dizer o motivo. Agora avisamos na hora e explicamos o conserto.
+        # ---------------------------------------------------------------
+        _faltando = [n for n, v in (("positive", positive), ("negative", negative)) if v is None]
+        if _faltando:
+            raise ValueError(
+                f"[Bernini Infinity] {' e '.join(_faltando)} chegou(aram) VAZIO(S) (None).\n"
+                f"Causa mais comum: o 'Prompt Guide (Bruxos)' esta SEM a entrada 'clip' ligada. "
+                f"Sem CLIP ele nao consegue codificar o texto e devolve None em positive/negative "
+                f"(so os textos saem preenchidos) -- olhe no console a linha "
+                f"'[BruxosPromptGuide] sem CLIP: retornando apenas os textos.'\n"
+                f"Conserto: ligue o CLIP (ex.: CLIPLoader/CLIPLoaderGGUF) na entrada 'clip' do Prompt Guide, "
+                f"OU use um 'CLIP Text Encode' normal e ligue a saida dele aqui."
+            )
+
+        if guidance_mode == "multi":
+            # legado: 'multi' era exatamente o encadeado de 4 forwards = rv2v.
+            self._g_mode, self._g_bmode = "stream", "rv2v"
+        elif guidance_mode in _BX_STREAM_MODES:
+            self._g_mode, self._g_bmode = "stream", guidance_mode
+        elif guidance_mode == "tiled":
+            self._g_mode, self._g_bmode = "tiled", None
+        else:
+            self._g_mode, self._g_bmode = "off", None
+        self._g_apg_eta = float(apg_eta)
+        self._g_apg_momentum = float(apg_momentum)
+        self._g_apg_norm_threshold = float(apg_norm_threshold)
+        self._g_omega_scale = float(omega_scale)
+        self._g_apg_rescale = bool(apg_rescale)
         self._g_wvid = float(w_vid)
         self._g_wimg = float(w_img)
+        # ref_influence_vid_off/ref_influence_img_off so se aplicam FORA dos modos
+        # de stream (la quem pondera de verdade e w_vid/w_img via multi-stream);
+        # nos modos de stream ficam neutros (1.0) pra nao dobrar o efeito.
+        self._g_ref_scale_vid = float(ref_influence_vid_off) if self._g_mode != "stream" else 1.0
+        self._g_ref_scale_img = float(ref_influence_img_off) if self._g_mode != "stream" else 1.0
         self._g_cfg_warned = False
         # ladrilho (usado quando guidance_mode == 'tiled')
         self._g_cols = int(tile_w)
@@ -1008,9 +1123,14 @@ class BerniniInfinity:
         self._g_tile_cleanup = True
         if monitor_memoria:
             _mem_report("inicio")
-        if self._g_mode == "multi":
-            print(f"[Bernini Infinity] guidance_mode=multi (w_txt=cfg={cfg}, w_vid={w_vid}, w_img={w_img}) "
-                  f"-> 4 forwards/step. Fallback p/ CFG se o formato do cond nao bater.", flush=True)
+        if self._g_mode == "stream":
+            _nfwd = {"rv2v": 4, "v2v_chain": 3, "r2v_apg": 3}.get(self._g_bmode, 2)
+            _nfwd_s = "2-4 (auto)" if self._g_bmode == "auto" else str(_nfwd)
+            print(f"[Bernini Infinity] guidance_mode={self._g_bmode} (w_txt=cfg={cfg}, "
+                  f"w_vid={w_vid}, w_img={w_img}) -> {_nfwd_s} forwards/step"
+                  + (f" | APG eta={apg_eta}" if str(self._g_bmode).endswith("_apg") else "")
+                  + (f" | omega_scale={omega_scale} no low" if float(omega_scale) != 1.0 else "")
+                  + ". Fallback p/ CFG se o formato do cond nao bater.", flush=True)
         elif self._g_mode == "tiled":
             print(f"[Bernini Infinity] guidance_mode=tiled ({tile_w}x{tile_h}, overlap {tile_overlap}) "
                   f"-> ladrilho fundido a cada passo (maiores resolucoes / menos VRAM). "
@@ -1025,6 +1145,32 @@ class BerniniInfinity:
         sampler = KSamplerSelect.execute(sampler_name).args[0]
         sigmas = BasicScheduler.execute(low_model, scheduler, int(steps), float(denoise)).args[0]
         high_sigmas, low_sigmas = SplitSigmas.execute(sigmas, int(split_step)).args
+
+        # ---------------------------------------------------------------
+        # split_step DEGENERADO (BUG DE TELA PRETA)
+        # split_step=0 -> high_sigmas fica com UM sigma so (nenhum passo real)
+        # e low_sigmas comeca no sigma MAXIMO. Como o passo low roda com
+        # add_noise=False (ruido = zeros), o noise_scaling do flow-matching faz
+        #     x = sigma*ruido + (1-sigma)*latente
+        # e em sigma_max (=1.0) isso vira 1.0*0 + 0.0*latente = ZERO.
+        # O latente e zerado antes de denoisar -> saida PRETA. Nao tem a ver com
+        # o modelo (1.3B vs 14B): e puramente o split degenerado.
+        # Correcao: com split_step<=0 pulamos o passo high e o passo LOW e quem
+        # adiciona o ruido (que e exatamente o que o tooltip promete: "0 = so
+        # usa o low"). Simetricamente, split_step >= steps roda so o high.
+        # ---------------------------------------------------------------
+        _n_sig = int(sigmas.shape[0])
+        self._bx_skip_high = int(split_step) <= 0
+        self._bx_skip_low = int(split_step) >= (_n_sig - 1)
+        if self._bx_skip_high:
+            low_sigmas = sigmas
+            print("[Bernini Infinity] split_step=0 -> passo HIGH desligado; o modelo LOW faz "
+                  "todos os passos (e adiciona o ruido). Antes isso zerava o latente e a saida "
+                  "saia PRETA.", flush=True)
+        elif self._bx_skip_low:
+            high_sigmas = sigmas
+            print(f"[Bernini Infinity] split_step={int(split_step)} >= steps -> passo LOW desligado; "
+                  f"o modelo HIGH faz todos os passos.", flush=True)
 
         reference_images = {
             key: value
@@ -1064,6 +1210,25 @@ class BerniniInfinity:
     #     + (tail_memory: frames JA EDITADOS do chunk anterior).
     #   - juncao por CROSSFADE de latente (sem corte seco).
     # ------------------------------------------------------------------
+    def _pass_high(self, model, seed, cfg, positive, negative, sampler, sigmas, latent):
+        """Passo HIGH. Com split_step<=0 ele e PULADO (devolve o latente intacto)
+        e quem adiciona o ruido e o passo low -- ver a nota do split degenerado."""
+        if getattr(self, "_bx_skip_high", False):
+            return latent
+        return self._sample_pass(model, True, int(seed), cfg, positive, negative,
+                                 sampler, sigmas, latent)
+
+    def _pass_low(self, model, cfg, positive, negative, sampler, sigmas, latent, seed=0):
+        """Passo LOW. Se o high foi pulado, este e o unico passo -> e ELE que
+        adiciona o ruido (add_noise=True), senao o latente seria zerado no
+        sigma maximo e a saida sairia preta."""
+        if getattr(self, "_bx_skip_low", False):
+            return latent
+        add_noise = bool(getattr(self, "_bx_skip_high", False))
+        return self._sample_pass(model, add_noise, int(seed) if add_noise else 0,
+                                 cfg, positive, negative, sampler, sigmas, latent,
+                                 is_low=True)
+
     def _sample_pass(
         self,
         model,
@@ -1075,19 +1240,27 @@ class BerniniInfinity:
         sampler,
         sigmas,
         latent,
+        is_low=False,
     ):
         """Um passo de sampling.
 
-        guidance_mode='off'  -> SamplerCustom normal (CFG unico). Em cfg=1.0 o
+        guidance_mode='off'   -> SamplerCustom normal (CFG unico). Em cfg=1.0 o
           ComfyUI ja pula o passe negativo: 1 forward por step.
-        guidance_mode='multi'-> guider multi-stream (eq. 8-12): 4 forwards por
-          step (~4x mais lento em cfg=1.0). Em modelo cfg-destilado (lightx2v)
-          isso e fora da distribuicao: avisa, mas RESPEITA a escolha do usuario.
-        Se o multi falhar (formato do cond, API do fork), cai pro CFG padrao.
+        guidance_mode=stream  -> guider multi-stream: 2 a 4 forwards por step
+          conforme o modo (v2v=2, v2v_chain=3, rv2v=4). Em modelo cfg-destilado
+          (lightx2v) isso e fora da distribuicao: avisa, mas RESPEITA a escolha.
+        is_low=True aplica o omega_scale (rescale da guidance no regime de baixo
+        ruido, igual ao switch high->low do Bernini).
+        Se falhar (formato do cond, API do fork), cai pro CFG padrao.
         """
         guidance_mode = getattr(self, "_g_mode", "off")
 
-        if guidance_mode == "multi":
+        # omega_scale: reduz a forca da guidance UMA vez, no passo low-noise.
+        _osc = float(getattr(self, "_g_omega_scale", 1.0)) if is_low else 1.0
+        if _osc != 1.0:
+            cfg = float(cfg) * _osc
+
+        if guidance_mode == "stream":
             # aviso honesto (uma vez) -- mas NAO desliga sozinho.
             if float(cfg) <= 1.5 and not getattr(self, "_g_cfg_warned", False):
                 self._g_cfg_warned = True
@@ -1110,8 +1283,14 @@ class BerniniInfinity:
                 sampler,
                 sigmas,
                 latent,
-                getattr(self, "_g_wvid", 1.25),
-                getattr(self, "_g_wimg", 1.25),
+                getattr(self, "_g_wvid", 1.25) * _osc,
+                getattr(self, "_g_wimg", 1.25) * _osc,
+                bmode=getattr(self, "_g_bmode", "rv2v") or "rv2v",
+                apg_eta=getattr(self, "_g_apg_eta", 1.0),
+                apg_momentum=getattr(self, "_g_apg_momentum", 0.0),
+                apg_norm_threshold=getattr(self, "_g_apg_norm_threshold", 0.0),
+                omega_scale=_osc,
+                apg_rescale=getattr(self, "_g_apg_rescale", False),
             )
             if out is not None:
                 return out
@@ -1193,6 +1372,7 @@ class BerniniInfinity:
                 _collect_reference_latents(
                     vae, true_len, int(ref_max_size),
                     reference_video=reference_video, reference_images=reference_images,
+                    scale_vid=self._g_ref_scale_vid, scale_img=self._g_ref_scale_img,
                 )
             )
 
@@ -1217,8 +1397,8 @@ class BerniniInfinity:
                 flush=True,
             )
 
-            high = self._sample_pass(
-                high_model, True, chunk_seed, float(cfg), pos, neg, sampler, high_sigmas, latent
+            high = self._pass_high(
+                high_model, chunk_seed, float(cfg), pos, neg, sampler, high_sigmas, latent
             )
             # limpa a VRAM entre o high pass e o low pass (os dois modelos
             # nunca precisam ficar residentes juntos quando 'agressivo').
@@ -1226,8 +1406,8 @@ class BerniniInfinity:
                 _mem_report(f"chunk {chunk_index + 1} pos-high")
             _mem_cleanup(limpar_vram, model=high_model, between_passes=True,
                          force_unload=bool(force_unload_between_passes))
-            low = self._sample_pass(
-                low_model, False, 0, float(cfg), pos, neg, sampler, low_sigmas, high
+            low = self._pass_low(
+                low_model, float(cfg), pos, neg, sampler, low_sigmas, high, seed=chunk_seed
             )
             chunk_latent = low["samples"]
             imgs = _decode_video(vae, chunk_latent, bool(decode_tiled))
@@ -1351,6 +1531,7 @@ class BerniniInfinity:
             _collect_reference_latents(
                 vae, int(aligned), int(ref_max_size),
                 reference_video=reference_video, reference_images=reference_images,
+                scale_vid=self._g_ref_scale_vid, scale_img=self._g_ref_scale_img,
             )
         )
         values = {"context_latents": context_latents}
@@ -1381,13 +1562,13 @@ class BerniniInfinity:
             hi.set_model_unet_function_wrapper(wrapper)
             lo.set_model_unet_function_wrapper(wrapper)
 
-        high = self._sample_pass(hi, True, int(seed), float(cfg), pos, neg, sampler, high_sigmas, latent)
+        high = self._pass_high(hi, int(seed), float(cfg), pos, neg, sampler, high_sigmas, latent)
         # limpeza de VRAM entre high pass e low pass
         if monitor_memoria:
             _mem_report("pos-high")
         _mem_cleanup(limpar_vram, model=hi, between_passes=True,
                      force_unload=bool(force_unload_between_passes))
-        low = self._sample_pass(lo, False, 0, float(cfg), pos, neg, sampler, low_sigmas, high)
+        low = self._pass_low(lo, float(cfg), pos, neg, sampler, low_sigmas, high, seed=int(seed))
         result_latent = low["samples"]
 
         if int(decode_chunk) > 0:
@@ -1461,6 +1642,7 @@ class BerniniInfinity:
             _collect_reference_latents(
                 vae, int(aligned), int(ref_max_size),
                 reference_video=reference_video, reference_images=reference_images,
+                scale_vid=self._g_ref_scale_vid, scale_img=self._g_ref_scale_img,
             )
         )
         values = {"context_latents": context_latents}
@@ -1469,16 +1651,16 @@ class BerniniInfinity:
 
         latent = {"samples": _make_empty_latent(int(aligned), cw, ch, 1)}
 
-        high = self._sample_pass(
-            high_model.clone(), True, int(seed), float(cfg), pos, neg, sampler, high_sigmas, latent
+        high = self._pass_high(
+            high_model.clone(), int(seed), float(cfg), pos, neg, sampler, high_sigmas, latent
         )
         # limpeza de VRAM entre high pass e low pass
         if monitor_memoria:
             _mem_report("bbox pos-high")
         _mem_cleanup(limpar_vram, model=high_model, between_passes=True,
                      force_unload=bool(force_unload_between_passes))
-        low = self._sample_pass(
-            low_model.clone(), False, 0, float(cfg), pos, neg, sampler, low_sigmas, high
+        low = self._pass_low(
+            low_model.clone(), float(cfg), pos, neg, sampler, low_sigmas, high, seed=int(seed)
         )
         crop_latent = low["samples"]
 
@@ -2153,14 +2335,26 @@ _BX_BERNINI_ENH_SYSTEM = (
     "Rewrite the user's request into ONE detailed, structured and semantically "
     "enriched instruction that the model can follow precisely.\n"
     "Rules:\n"
+    "- The user's request may come in ANY language (Portuguese, Spanish, etc). "
+    "ALWAYS write the rewritten instruction in ENGLISH, regardless of the input "
+    "language -- Wan's text encoder was trained mostly on English/Chinese captions "
+    "and follows English instructions far more reliably. Translate first, then enrich.\n"
     "- Preserve the user's original intent EXACTLY. Never add edits they did not ask for.\n"
     "- Name the target region/object and the operation clearly.\n"
     "- State what must stay UNCHANGED for consistency (identity, background, lighting) "
     "and require temporal coherence across all frames.\n"
     "- Be concrete and visual (materials, lighting, motion, camera), not abstract.\n"
     "- If source frames are provided, ground the description in what you actually see.\n"
-    "Output ONLY the rewritten instruction as plain text: no preamble, no quotes, "
-    "no explanations, no markdown."
+    "- REFERENCE IMAGES: Bernini was TRAINED on the literal marker 'from imageN'. "
+    "If the user refers to a reference image, name it EXACTLY as 'image0', 'image1', "
+    "... in the form 'from image0' (e.g. 'Replace the man with the old man from image0'). "
+    "Never write 'reference_image_0', 'the first reference', 'the attached picture' or "
+    "any paraphrase -- only the trained form works. Reference slots are filled in order "
+    "starting at image0, so use image0 first, then image1, and so on.\n"
+    "- The SOURCE VIDEO is implicit: never name it in the instruction. Just describe "
+    "what happens in it naturally.\n"
+    "Output ONLY the rewritten instruction as plain text, IN ENGLISH: no preamble, "
+    "no quotes, no explanations, no markdown."
 )
 
 # Direcionamento por tipo de tarefa (taxonomia do Bernini-Bench, 5 dimensoes).
@@ -2370,8 +2564,10 @@ class BruxosBerniniPromptEnhancer:
             except Exception:
                 pass
 
+        preview = (enhanced[:220] + "…") if len(enhanced) > 220 else enhanced
         print(f"[Bernini PromptEnhancer] task={task} | in={len(user_instr)}ch -> out={len(enhanced)}ch"
-              f"{' | +grounding' if pil_frames else ''}", flush=True)
+              f"{' | +grounding' if pil_frames else ''}\n"
+              f"[Bernini PromptEnhancer] enhanced_prompt: {preview!r}", flush=True)
         return (enhanced, reasoning)
 
 
@@ -2684,69 +2880,204 @@ def _bx_set_ctx(cond, ctx):
     return out
 
 
+# -----------------------------------------------------------------------------
+# APG (Adaptive Projected Guidance) -- port da matematica de bernini/guidance.py
+# (comfyui-berninir, Apache-2.0). Em vez de somar o delta (e1-e0) cru, decompoe
+# em componente PARALELA e ORTOGONAL ao vetor "base" normalizado, e recombina
+# como ortogonal + eta*paralela. eta<1 suprime a parte que costuma "queimar"/
+# saturar a imagem em CFG alto. Tem tambem clamp de norma (norm_threshold) e
+# um MomentumBuffer (EMA) opcional. Com eta=1.0, momentum=0.0, norm_threshold=0
+# isso e MATEMATICAMENTE IDENTICO a devolver o delta cru (CFG classico) --
+# ou seja, os defaults sao neutros e o comportamento antigo nao muda.
+# Reducao das normas em dim=[-1,-2,-4] = {W,H,C} POR FRAME (nunca T nem B),
+# igual ao original -- e o que faz a guidance ser por-frame.
+# -----------------------------------------------------------------------------
+class _BxApgMomentum:
+    def __init__(self, momentum: float):
+        self.momentum = float(momentum)
+        self.running_average = 0
+
+    def update(self, update_value):
+        self.running_average = update_value + self.momentum * self.running_average
+
+
+_BX_APG_DIMS = [-1, -2, -4]   # {W, H, C} por frame -- nunca T (-3) nem B (-5)
+
+
+def _bx_apg_normalize_diff(diff, base_pred, momentum_buffer, eta, norm_threshold):
+    if momentum_buffer is not None:
+        momentum_buffer.update(diff)
+        diff = momentum_buffer.running_average
+    if norm_threshold and norm_threshold > 0:
+        ones = torch.ones_like(diff)
+        diff_norm = diff.norm(p=2, dim=_BX_APG_DIMS, keepdim=True)
+        scale_factor = torch.minimum(ones, torch.as_tensor(norm_threshold, device=diff.device) / diff_norm)
+        diff = diff * scale_factor
+    v0, v1 = diff.double(), base_pred.double()
+    v1 = v1 / v1.norm(p=2, dim=_BX_APG_DIMS, keepdim=True).clamp_min(1e-12)
+    v0_parallel = (v0 * v1).sum(dim=_BX_APG_DIMS, keepdim=True) * v1
+    v0_orthogonal = v0 - v0_parallel
+    diff_parallel, diff_orthogonal = v0_parallel.to(diff.dtype), v0_orthogonal.to(diff.dtype)
+    return diff_orthogonal + float(eta) * diff_parallel
+
+
+def _bx_apg_rescale(out, ref):
+    """Renormaliza `out` pra ter a MESMA norma (por frame) da predicao de
+    referencia `ref` (a condicional). E o 'apg_rescale' do BerniniRWrapper:
+    a projecao APG encolhe a magnitude do resultado, e sem isso a imagem tende
+    a sair lavada/sem contraste em guidance alto. Mesma reducao de dims da APG."""
+    n_out = out.norm(p=2, dim=_BX_APG_DIMS, keepdim=True).clamp_min(1e-12)
+    n_ref = ref.norm(p=2, dim=_BX_APG_DIMS, keepdim=True)
+    return out * (n_ref / n_out)
+
+
 if _bx_samplers is not None and hasattr(_bx_samplers, "CFGGuider"):
 
     class _BerniniMultiGuider(_bx_samplers.CFGGuider):
-        """CFGGuider que faz guidance independente por stream (video/refs/texto)."""
+        """CFGGuider com os 7 modos de guidance do Bernini.
 
-        def set_bernini(self, w_txt, w_vid, w_img):
+        Cada modo usa um NUMERO DIFERENTE de forwards por passo -- e essa e a
+        diferenca de custo. O 'rv2v' (4 fwd) e o que o antigo guidance_mode=multi
+        fazia; os outros sao mais baratos:
+            v2v / t2v / v2v_apg / t2v_apg -> 2 forwards
+            v2v_chain / r2v_apg           -> 3 forwards
+            rv2v                          -> 4 forwards
+        Os modos *_apg usam a projecao APG (ortogonal + eta*paralela) em vez da
+        soma crua do delta. Como o calc_cond_batch do ComfyUI ja devolve x0
+        (denoised), a APG e aplicada no espaco certo sem converter eps<->x0.
+        """
+
+        def set_bernini(self, w_txt, w_vid, w_img, bmode="rv2v",
+                         apg_eta=1.0, apg_momentum=0.0, apg_norm_threshold=0.0,
+                         omega_scale=1.0, apg_rescale=False):
             self._w_txt = float(w_txt)
             self._w_vid = float(w_vid)
             self._w_img = float(w_img)
+            self._bmode = str(bmode or "rv2v")
+            self._apg_eta = float(apg_eta)
+            self._apg_norm_threshold = float(apg_norm_threshold)
+            self._apg_rescale = bool(apg_rescale)
+            # omega_scale ja vem APLICADO pelo caller no passo low (ver _sample_pass):
+            # guardamos so pra log/diagnostico.
+            self._omega_scale = float(omega_scale)
+            # MomentumBuffers da APG. Persistem entre os STEPS de um mesmo pass
+            # (e o ponto do momentum); como cada pass high/low constroi um guider
+            # novo, resetam naturalmente na troca de experto.
+            self._apg_mb = [_BxApgMomentum(apg_momentum) for _ in range(3)]
+
+        def _resolve_mode(self, has_vid, has_img):
+            """'auto' -> escolhe o modo mais BARATO que ainda cobre os streams
+            presentes (mesma tabela TASK_TO_GUIDANCE do BerniniR)."""
+            m = self._bmode
+            if m and m != "auto":
+                return m
+            if has_vid and has_img:
+                return "rv2v"        # video + refs -> encadeado de 4 fwd
+            if not has_vid and not has_img:
+                return "t2v"         # texto puro -> 2 fwd
+            return "v2v"             # so video OU so imagem -> 2 fwd
+
+        def _apg(self, diff, base, i):
+            return _bx_apg_normalize_diff(diff, base, self._apg_mb[i],
+                                          self._apg_eta, self._apg_norm_threshold)
 
         def predict_noise(self, x, timestep, model_options={}, seed=None):
             pos = self.conds.get("positive")
             neg = self.conds.get("negative")
             ctx = _bx_ctx_of(pos) if pos else []
 
-            # sem contexto no formato esperado -> CFG classico + diagnostico 1x.
-            # (acontece em T2V, ou se o formato interno do cond deste fork diferir;
-            #  nesse caso o node NAO quebra: roda igual ao CFG normal e imprime o
-            #  formato pra ajustarmos o slicer.)
-            if not ctx:
+            vid = ctx[:1]      # 1o stream = video-fonte (BerniniConditioning ordena assim)
+            refs = ctx[1:]     # demais = imagens/video de referencia
+            allc = ctx
+            mode = self._resolve_mode(bool(vid), bool(refs))
+
+            # modos que NAO precisam de contexto (t2v/t2v_apg) rodam mesmo sem ctx.
+            if not ctx and mode not in ("t2v", "t2v_apg"):
                 if not getattr(self, "_bx_diag_done", False):
                     self._bx_diag_done = True
                     try:
                         s = pos[0] if pos else None
                         keys = list(s.keys()) if isinstance(s, dict) else "(cru [t,d])"
-                        print(f"[Bernini Multi-Guidance][diag] context_latents nao encontrado no "
+                        print(f"[Bernini Guidance][diag] context_latents nao encontrado no "
                               f"formato esperado; usando CFG padrao. cond[0]={type(s).__name__} "
-                              f"keys={keys}. Se esperava multi, mande esta linha pro Claude.", flush=True)
+                              f"keys={keys}. Se esperava multi-stream, mande esta linha pro Claude.",
+                              flush=True)
                     except Exception:
                         pass
                 return super().predict_noise(x, timestep, model_options, seed)
 
-            vid = ctx[:1]           # 1o stream = video-fonte (BerniniConditioning ordena assim)
-            allc = ctx              # video + refs
+            # ---- monta a lista de forwards que o modo exige --------------------
+            # cada entrada: (contexto, texto)   None = sem contexto
+            if mode == "rv2v":
+                plan = [(None, neg), (vid, neg), (allc, neg), (allc, pos)]
+            elif mode in ("v2v", "v2v_apg"):
+                plan = [(allc, neg), (allc, pos)]
+            elif mode == "v2v_chain":
+                plan = [(None, neg), (vid, neg), (allc, pos)]
+            elif mode in ("t2v", "t2v_apg"):
+                plan = [(None, neg), (None, pos)]
+            elif mode == "r2v_apg":
+                plan = [(None, neg), (refs, neg), (refs, pos)]
+            else:
+                print(f"[Bernini Guidance] modo desconhecido '{mode}'; usando CFG padrao.", flush=True)
+                return super().predict_noise(x, timestep, model_options, seed)
 
-            c0 = _bx_set_ctx(neg, None)    # sem contexto, texto-neg
-            c1 = _bx_set_ctx(neg, vid)     # +video,        texto-neg
-            c2 = _bx_set_ctx(neg, allc)    # +video+refs,   texto-neg
-            c3 = _bx_set_ctx(pos, allc)    # +video+refs,   texto-pos
+            conds = [_bx_set_ctx(txt, c) for (c, txt) in plan]
+
+            if not getattr(self, "_bx_mode_logged", False):
+                self._bx_mode_logged = True
+                print(f"[Bernini Guidance] modo={mode} | {len(conds)} forward(s)/step | "
+                      f"w_vid={self._w_vid:.2f} w_img={self._w_img:.2f} w_txt={self._w_txt:.2f}"
+                      f"{' | APG eta=%.2f' % self._apg_eta if mode.endswith('_apg') else ''}",
+                      flush=True)
 
             try:
                 outs = _bx_samplers.calc_cond_batch(
-                    self.inner_model, [c0, c1, c2, c3], x, timestep, model_options
+                    self.inner_model, conds, x, timestep, model_options
                 )
             except Exception as e:
-                # fallback seguro: CFG classico
-                print(f"[Bernini Multi-Guidance] calc_cond_batch falhou ({e}); "
+                print(f"[Bernini Guidance] calc_cond_batch falhou ({e}); "
                       f"caindo pro CFG padrao. Rode um smoke test / mande o erro.", flush=True)
                 return super().predict_noise(x, timestep, model_options, seed)
 
-            e0, e1, e2, e3 = outs[0], outs[1], outs[2], outs[3]
             wv, wi, wt = self._w_vid, self._w_img, self._w_txt
-            return e0 + wv * (e1 - e0) + wi * (e2 - e1) + wt * (e3 - e2)
+
+            # ---- combina conforme o modo --------------------------------------
+            if mode == "rv2v":
+                e0, e1, e2, e3 = outs
+                return e0 + wv * (e1 - e0) + wi * (e2 - e1) + wt * (e3 - e2)
+            if mode == "v2v":
+                eu, ec = outs
+                return eu + wt * (ec - eu)
+            if mode == "v2v_chain":
+                e0, e1, e2 = outs
+                return e0 + wv * (e1 - e0) + wt * (e2 - e1)
+            if mode == "t2v":
+                eu, ec = outs
+                return eu + wt * (ec - eu)
+            if mode in ("v2v_apg", "t2v_apg"):
+                eu, ec = outs
+                out = eu + wt * self._apg(ec - eu, ec, 0)
+                return _bx_apg_rescale(out, ec) if self._apg_rescale else out
+            # r2v_apg: encadeada -- cada diff contra o estagio anterior
+            e0, e1, e2 = outs
+            d1 = self._apg(e1 - e0, e1, 0)
+            d2 = self._apg(e2 - e1, e2, 1)
+            out = e0 + wi * d1 + wt * d2
+            return _bx_apg_rescale(out, e2) if self._apg_rescale else out
 
 
-def _bx_multi_sample(model, add_noise, seed, cfg, positive, negative, sampler, sigmas, latent, w_vid, w_img):
+def _bx_multi_sample(model, add_noise, seed, cfg, positive, negative, sampler, sigmas, latent, w_vid, w_img,
+                      bmode="rv2v", apg_eta=1.0, apg_momentum=0.0, apg_norm_threshold=0.0,
+                      omega_scale=1.0, apg_rescale=False):
     """Roda UM passo de sampling com guidance multi-stream (usado pelo Bernini
-    Infinity no guidance_mode='multi'). Reusa o SamplerCustomAdvanced canonico
+    Infinity nos guidance_mode de stream). Reusa o SamplerCustomAdvanced canonico
     (mesmo dominio do SamplerCustom, so troca o guider). Retorna o dict de latent
     (igual .args[0] do SamplerCustom) ou None p/ cair no caminho padrao."""
     if _bx_samplers is None or not hasattr(_bx_samplers, "CFGGuider"):
         return None
-    if not _bx_ctx_of(positive):
+    # t2v/t2v_apg nao dependem de context_latents; os demais sim.
+    if str(bmode) not in ("t2v", "t2v_apg") and not _bx_ctx_of(positive):
         return None  # sem contexto -> deixa o caminho CFG padrao cuidar
     try:
         from comfy_extras.nodes_custom_sampler import (
@@ -2763,7 +3094,10 @@ def _bx_multi_sample(model, add_noise, seed, cfg, positive, negative, sampler, s
             guider.set_cfg(float(cfg))
         except Exception:
             pass
-        guider.set_bernini(float(cfg), float(w_vid), float(w_img))
+        guider.set_bernini(float(cfg), float(w_vid), float(w_img), bmode=str(bmode),
+                            apg_eta=float(apg_eta), apg_momentum=float(apg_momentum),
+                            apg_norm_threshold=float(apg_norm_threshold),
+                            omega_scale=float(omega_scale), apg_rescale=bool(apg_rescale))
         noise = _NR(int(seed)) if add_noise else _NE()
         out = _SCA.execute(noise, guider, sampler, sigmas, latent)
         # SamplerCustomAdvanced devolve (output_latent, denoised); pegamos o 1o
@@ -2836,6 +3170,19 @@ class BruxosBerniniMultiGuidance:
                     "tooltip": "Guidance do VIDEO-fonte (adesao ao source). Maior = mais fiel ao original; menor = mais liberdade pra editar. -1 = preset."}),
                 "w_img": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 30.0, "step": 0.05,
                     "tooltip": "Guidance das IMAGENS/refs. Em RV2V pese mais (paper: 3.0). -1 = preset."}),
+                # --- APPEND-ONLY (ver nota no BerniniInfinity) ---
+                "guidance_mode": (["auto", "rv2v", "v2v", "v2v_chain", "t2v",
+                                   "v2v_apg", "t2v_apg", "r2v_apg"], {"default": "rv2v", "tooltip":
+                    "Quantos forwards por passo (= custo). v2v/t2v/*_apg simples = 2; v2v_chain e r2v_apg = 3; rv2v = 4. "
+                    "auto escolhe o mais barato que cobre os streams ligados. Modos _apg usam projecao APG (menos saturacao)."}),
+                "apg_eta": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "[modos *_apg] Peso da componente paralela. 1.0 = CFG normal (neutro). 0.5 = Bernini; 0.15 = BerniniRWrapper (mais forte)."}),
+                "apg_momentum": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "[modos *_apg] EMA do delta entre passos. 0 = off (padrao do Bernini)."}),
+                "apg_norm_threshold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 500.0, "step": 1.0,
+                    "tooltip": "[modos *_apg] Teto da norma do delta (clamp). 0 = sem limite. Bernini usa 50.0."}),
+                "apg_rescale": ("BOOLEAN", {"default": False,
+                    "tooltip": "[modos *_apg] Renormaliza o resultado pra magnitude da predicao condicional (evita imagem lavada). BerniniRWrapper usa ligado."}),
             },
         }
 
@@ -2857,7 +3204,8 @@ class BruxosBerniniMultiGuidance:
     )
 
     def build(self, model, positive, negative, task, mode,
-              w_txt=-1.0, w_vid=-1.0, w_img=-1.0):
+              w_txt=-1.0, w_vid=-1.0, w_img=-1.0, guidance_mode="rv2v",
+              apg_eta=0.5, apg_momentum=0.0, apg_norm_threshold=0.0, apg_rescale=False):
         if _bx_samplers is None or not hasattr(_bx_samplers, "CFGGuider"):
             raise RuntimeError(
                 "[Bernini Multi-Guidance] comfy.samplers.CFGGuider nao encontrado neste build. "
@@ -2880,12 +3228,16 @@ class BruxosBerniniMultiGuidance:
             guider.set_cfg(wt)   # coerencia com o fallback de CFG classico
         except Exception:
             pass
-        guider.set_bernini(wt, wv, wi)
+        guider.set_bernini(wt, wv, wi, bmode=str(guidance_mode),
+                            apg_eta=float(apg_eta), apg_momentum=float(apg_momentum),
+                            apg_norm_threshold=float(apg_norm_threshold),
+                            apg_rescale=bool(apg_rescale))
 
         warn = ""
         if turbo and wt > 1.5:
             warn = " | AVISO: w_txt>1.5 com lightx2v costuma QUEIMAR."
-        info = (f"task={task} mode={'turbo' if turbo else 'full'} | "
+        _nf = {"rv2v": "4", "v2v_chain": "3", "r2v_apg": "3", "auto": "2-4"}.get(str(guidance_mode), "2")
+        info = (f"task={task} mode={'turbo' if turbo else 'full'} | guidance={guidance_mode} ({_nf} fwd/step) | "
                 f"w_txt={wt:.2f} w_vid={wv:.2f} w_img={wi:.2f} | steps={steps} shift={shift:.1f}{warn}")
         print(f"[Bernini Multi-Guidance] {info}", flush=True)
         return (guider, int(steps), float(shift), info)
@@ -3036,7 +3388,7 @@ import gc as _bx_gc3
 
 _BX_DVD_REPO_URL = "https://github.com/EnVision-Research/DVD.git"
 _BX_DVD_REPO_NAME = "dvd_repo"
-_BX_DVD_HF_REPO = "EnVisionResearch/DVD"
+_BX_DVD_HF_REPO = "FayeHongfeiZhang/DVD"  # mesmo repo HF usado pelo comfy-dvd padrao
 _BX_DVD_CKPT_NAME = "model.safetensors"
 
 # Diretórios de busca do dvd_repo
@@ -3048,6 +3400,17 @@ _BX_DVD_REPO_CANDIDATES = [
 ]
 
 _BX_DVD_ENGINE = {"repo": None, "model": None, "ckpt": None, "device": None}
+
+# Registra a pasta models/dvd_depth no ComfyUI (igual ao comfy-dvd padrao),
+# assim o checkpoint fica compartilhado entre os dois nodes e some da lista
+# de "baixar de novo" se o comfy-dvd ja tiver baixado.
+try:
+    import folder_paths as _bx_folder_paths3
+    _BX_DVD_MODEL_DIR = _bx_os3.path.join(_bx_folder_paths3.models_dir, "dvd_depth")
+    _bx_os3.makedirs(_BX_DVD_MODEL_DIR, exist_ok=True)
+    _bx_folder_paths3.add_model_folder_path("dvd_depth", _BX_DVD_MODEL_DIR)
+except Exception:
+    _BX_DVD_MODEL_DIR = None
 
 
 def _bx_dvd_find_repo():
@@ -3351,45 +3714,17 @@ def _bx_dvd_load_model(checkpoint_name, device):
 
     yaml_args = OmegaConf.load(config_path)
 
-    # Resolve o path base do Wan (procura em COMFY_MODEL_TYPE_DVD_DEPTH ou subpastas)
-    wan_base_path = None
-    env_paths = _bx_os3.environ.get("COMFY_MODEL_TYPE_DVD_DEPTH", "")
-    for folder in env_paths.split(_bx_os3.pathsep):
-        folder = folder.strip()
-        if not folder:
-            continue
-        # Procura Wan_dvd na hierarquia
-        for root, dirs, _ in _bx_os3.walk(folder):
-            if "Wan_dvd" in dirs or "wan_dvd" in [d.lower() for d in dirs]:
-                wan_base_path = _bx_os3.path.join(root, "Wan_dvd" if "Wan_dvd" in dirs else [d for d in dirs if d.lower() == "wan_dvd"][0])
-                break
-        if wan_base_path:
-            break
-
-    if not wan_base_path:
-        # Fallback: procura na pasta models do ComfyUI
-        try:
-            import folder_paths
-            models_dir = folder_paths.models_dir
-            for root, dirs, _ in _bx_os3.walk(models_dir):
-                if "Wan_dvd" in dirs or "wan_dvd" in [d.lower() for d in dirs]:
-                    wan_base_path = _bx_os3.path.join(root, "Wan_dvd" if "Wan_dvd" in dirs else [d for d in dirs if d.lower() == "wan_dvd"][0])
-                    break
-        except Exception:
-            pass
-
-    if not wan_base_path:
-        raise RuntimeError(
-            "[BruxosDepthMask] Wan_dvd base não encontrado. "
-            "Defina COMFY_MODEL_TYPE_DVD_DEPTH apontando para a pasta que contém Wan_dvd/ "
-            "(com os pesos Wan2.1-T2V-1.3B e UMT5-XXL)."
-        )
-
-    tokenizer_root = _bx_os3.path.join(wan_base_path, "Wan-AI", "Wan2.1-T2V-1.3B")
-    local_model_ids = f"Wan-AI/Wan2.1-T2V-1.3B:{wan_base_path},google/umt5-xxl:{wan_base_path}"
-    yaml_args.model_id_with_origin_paths = local_model_ids
-
-    print(f"[BruxosDepthMask] Wan Backend Path: {wan_base_path}", flush=True)
+    # IGUAL ao comfy-dvd padrao: usa o model_id_with_origin_paths que ja vem no
+    # proprio model_config.yaml do dvd_repo (repo_id:origin real do Wan2.1-T2V-1.3B
+    # e do UMT5-XXL), deixando o DiffSynth baixar/cachear do HuggingFace sozinho.
+    #
+    # ANTES este bloco exigia uma pasta local chamada "Wan_dvd" (via
+    # COMFY_MODEL_TYPE_DVD_DEPTH ou dentro de models/) e sobrescrevia
+    # model_id_with_origin_paths com ela -- isso NAO existe no comfy-dvd padrao e
+    # so falhava aqui: "Wan_dvd base nao encontrado", mesmo com o comfy-dvd
+    # funcionando normalmente (porque ele nunca procurou essa pasta). Removido.
+    print(f"[BruxosDepthMask] model_id_with_origin_paths (do yaml): "
+          f"{yaml_args.model_id_with_origin_paths}", flush=True)
 
     # Import do training module (disponível após inserir o repo no path)
     from examples.wanvideo.model_training.WanTrainingModule import WanTrainingModule
@@ -3397,11 +3732,11 @@ def _bx_dvd_load_model(checkpoint_name, device):
     accelerator = Accelerator()
     model = WanTrainingModule(
         accelerator=accelerator,
-        model_id_with_origin_paths=local_model_ids,
+        model_id_with_origin_paths=yaml_args.model_id_with_origin_paths,
         trainable_models=None,
         use_gradient_checkpointing=False,
         lora_rank=yaml_args.lora_rank,
-        lora_base_model="dit",
+        lora_base_model=yaml_args.lora_base_model,
         args=yaml_args,
     )
 
@@ -3425,12 +3760,18 @@ def _bx_dvd_load_model(checkpoint_name, device):
 class BruxosDepthMask:
     @classmethod
     def INPUT_TYPES(cls):
+        ckpt_files = []
+        try:
+            import folder_paths as _bx_fp
+            ckpt_files = _bx_fp.get_filename_list("dvd_depth")
+        except Exception:
+            pass
         return {
             "required": {
                 "images": ("IMAGE", {"tooltip": "Vídeo de entrada (frames)."}),
-                "vae": ("VAE", {"tooltip": "VAE do Wan2.1 (reaproveitado do pipeline Bernini)."}),
-                "checkpoint": ("STRING", {"default": "model.safetensors",
-                    "tooltip": "Nome do checkpoint DVD (.safetensors). Procura em COMFY_MODEL_TYPE_DVD_DEPTH, models/dvd_depth, ou baixa do HF."}),
+                "checkpoint": (ckpt_files if ckpt_files else ["model.safetensors"],
+                    {"tooltip": "Checkpoint DVD (.safetensors). Procura em models/dvd_depth "
+                                 "(mesma pasta do comfy-dvd) ou baixa do HF na 1ª vez."}),
                 "scale": (["1.0", "0.75", "0.5", "0.25"], {"default": "0.5",
                     "tooltip": "Escala de processamento. Menor = menos VRAM."}),
                 "window_size": ("INT", {"default": 81, "min": 5, "max": 161, "step": 4,
@@ -3459,7 +3800,7 @@ class BruxosDepthMask:
     FUNCTION = "run"
     CATEGORY = "Bruxos do VFX/Mask"
 
-    def run(self, images, vae, checkpoint, scale, window_size, overlap, colormap,
+    def run(self, images, checkpoint, scale, window_size, overlap, colormap,
             invert=False, near=0.0, far=1.0, blur=0, device="auto"):
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -3503,10 +3844,11 @@ class BruxosDepthMask:
 
 BruxosDepthMask.DESCRIPTION = (
     "DepthMask DVD (Bruxos): máscara de profundidade usando **DVD Depth standalone** — "
-    "NÃO requer o comfy-dvd instalado. Traz a inferência DVD internamente.\n"
+    "NÃO requer o comfy-dvd instalado nem VAE (igual ao node DVD Depth padrão). "
+    "Traz a inferência DVD internamente.\n"
     "- images: vídeo de entrada.\n"
-    "- vae: VAE do Wan2.1 (reaproveitado).\n"
-    "- checkpoint: nome do .safetensors (procura local ou baixa do HF na 1ª vez).\n"
+    "- checkpoint: .safetensors em models/dvd_depth (mesma pasta do comfy-dvd) "
+    "ou baixado do HF na 1ª vez.\n"
     "- scale: 0.5 é o sweet spot para 24GB VRAM.\n"
     "- window_size/overlap: controle de janela temporal (4n+1, igual ao DVD original).\n"
     "- near/far/blur/invert: pós-processamento da máscara.\n"
@@ -3802,3 +4144,177 @@ NODE_DISPLAY_NAME_MAPPINGS["BruxosDepthMask"] = "Depth Mask DVD STANDALONE (Brux
 NODE_DISPLAY_NAME_MAPPINGS["BruxosColorMatch"] = "Color Match (Bruxos)"
 NODE_DISPLAY_NAME_MAPPINGS["BruxosFrameInterpolator"] = "Frame Interpolator (Bruxos)"
 NODE_DISPLAY_NAME_MAPPINGS["LyonirExtract"] = "Lyonir Extract (Bruxos)"
+
+# =============================================================================
+# BruxosChunkPlanner — calculadora de chunk/overlap sem bloco-toco
+# =============================================================================
+# Problema que resolve: com chunk=81 e overlap=8 o passo vira 73. Em 162 frames
+# isso da 3 blocos, sendo o ultimo com apenas 16 frames -- uma passada inteira
+# do modelo por um bloco curto, que ainda por cima sai pior (pouco contexto
+# temporal). Este node escolhe (chunk, overlap) que cobrem o video EXATAMENTE.
+#
+# Relacao usada:   total = chunk + (n-1) * step        overlap = chunk - step
+# =============================================================================
+
+def _bx_round_4n1(v, mode="near"):
+    """Arredonda para a grade 4n+1 (5, 9, ..., 77, 81, 85...) que o Wan espera."""
+    k = (float(v) - 1.0) / 4.0
+    if mode == "up":
+        k = math.ceil(k)
+    elif mode == "down":
+        k = math.floor(k)
+    else:
+        k = round(k)
+    return max(5, int(k) * 4 + 1)
+
+
+def _bx_plan_chunks(total, chunk_max, ov_min=8, prioridade="velocidade"):
+    """Retorna (chunk, overlap, n_blocos, custo, nota).
+
+    custo = frames processados no total (n * chunk). E o proxy direto de tempo:
+    dois planos com o mesmo custo levam o mesmo tempo.
+
+    prioridade:
+      velocidade -> menor custo (aceita overlap 0)
+      equilibrio -> menor custo entre os que respeitam ov_min; senao o menor custo
+      qualidade  -> maior overlap possivel sem passar de +25% de custo
+    """
+    total = max(1, int(total))
+    chunk_max = _bx_round_4n1(max(5, int(chunk_max)), "down")
+    ov_min = max(0, int(ov_min))
+
+    if total <= chunk_max:
+        c = _bx_round_4n1(total, "up")
+        return c, 0, 1, c, "bloco unico: o video inteiro cabe no chunk"
+
+    def plano(n, chunk):
+        if n < 2 or chunk >= total or chunk < 5:
+            return None
+        step = (total - chunk) / float(n - 1)
+        if step <= 0:
+            return None
+        ov = chunk - step
+        if ov < 0 or ov >= chunk:
+            return None
+        # overlap inteiro (o node consome INT); arredonda p/ baixo e o
+        # ultimo bloco fica ancorado no fim do video de qualquer forma
+        return (int(chunk), int(math.floor(ov + 1e-6)), int(n), int(n * chunk))
+
+    n_min = int(math.ceil(total / float(chunk_max)))
+    cands = []
+    for n in range(max(2, n_min), max(2, n_min) + 3):
+        # a) chunk cheio -> menos frames processados
+        p = plano(n, chunk_max)
+        if p:
+            cands.append(p)
+        # b) chunk encolhido ate atingir ov_min:
+        #    ov >= ov_min  <=>  chunk >= (ov_min*(n-1) + total) / n
+        alvo = (ov_min * (n - 1) + total) / float(n)
+        c = _bx_round_4n1(alvo, "up")
+        if c <= chunk_max:
+            p = plano(n, c)
+            if p:
+                cands.append(p)
+
+    if not cands:
+        return chunk_max, 0, n_min, n_min * chunk_max, "sem plano exato; usando chunk maximo"
+
+    cands = list({(c, o, n, k) for (c, o, n, k) in cands})
+    barato = min(k for (_, _, _, k) in cands)
+
+    if prioridade == "qualidade":
+        teto = barato * 1.25
+        viaveis = [p for p in cands if p[3] <= teto]
+        escolha = max(viaveis or cands, key=lambda p: (p[1], -p[3]))
+    elif prioridade == "equilibrio":
+        ok = [p for p in cands if p[1] >= ov_min]
+        escolha = min(ok or cands, key=lambda p: (p[3], -p[1]))
+    else:  # velocidade
+        escolha = min(cands, key=lambda p: (p[3], -p[1]))
+
+    chunk, ov, n, custo = escolha
+    nota = f"{n} bloco(s) de {chunk}f, passo {chunk - ov}f"
+    if ov < ov_min:
+        nota += f" | overlap {ov} < minimo pedido ({ov_min}): use tail_frames p/ continuidade"
+    return chunk, ov, n, custo, nota
+
+
+class BruxosChunkPlanner:
+    """Calcula chunk_size e overlap que cobrem o video sem sobrar bloco curto."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "frames_total": ("INT", {"default": 162, "min": 1, "max": 100000, "step": 1,
+                    "tooltip": "Total de frames do video. Se ligar 'source_video', este campo e ignorado."}),
+                "chunk_max": ("INT", {"default": 81, "min": 5, "max": 8192, "step": 4,
+                    "tooltip": "TETO de VRAM: maior bloco que sua placa aguenta. 81 e a janela nativa do Wan -- nao suba sem necessidade."}),
+                "overlap_min": ("INT", {"default": 8, "min": 0, "max": 512, "step": 1,
+                    "tooltip": "Overlap desejado. Em modo sequential o overlap e so crossfade; quem segura continuidade e o tail_frames."}),
+                "prioridade": (["velocidade", "equilibrio", "qualidade"], {"default": "velocidade",
+                    "tooltip": "velocidade = menos frames processados (aceita overlap 0). equilibrio = o mais barato que respeite o overlap_min. qualidade = maior overlap possivel gastando ate +25%."}),
+            },
+            "optional": {
+                "source_video": ("IMAGE", {"tooltip": "Opcional: le o numero de frames direto do video."}),
+            },
+        }
+
+    RETURN_TYPES = ("INT", "INT", "INT", "STRING")
+    RETURN_NAMES = ("chunk_size", "overlap", "blocos", "relatorio")
+    OUTPUT_TOOLTIPS = (
+        "Ligue no chunk_size do Bernini Infinity.",
+        "Ligue no overlap do Bernini Infinity.",
+        "Quantas passadas do modelo serao feitas (x2 se usar high+low).",
+        "Explicacao do plano e comparacao com a configuracao atual.",
+    )
+    FUNCTION = "run"
+    CATEGORY = "Bruxos do VFX/Video"
+
+    def run(self, frames_total, chunk_max, overlap_min, prioridade, source_video=None):
+        if source_video is not None:
+            frames_total = int(source_video.shape[0])
+        total = int(frames_total)
+
+        chunk, ov, n, custo, nota = _bx_plan_chunks(total, chunk_max, overlap_min, prioridade)
+
+        # plano ingenuo (o que acontece hoje sem este node), para comparar
+        c0 = _bx_round_4n1(chunk_max, "down")
+        s0 = max(1, c0 - int(overlap_min))
+        n0 = max(1, int(math.ceil(max(0, total - c0) / float(s0))) + 1)
+        ultimo0 = total - (n0 - 1) * s0
+        custo0 = n0 * c0
+
+        linhas = [
+            f"video: {total} frames",
+            f"plano: {nota}",
+            f"  chunk_size = {chunk} | overlap = {ov} | blocos = {n}",
+            f"  custo = {custo} frames processados",
+            "",
+            f"sem planejamento (chunk {c0}, overlap {overlap_min}):",
+            f"  blocos = {n0} | ultimo bloco = {ultimo0} frames | custo = {custo0}",
+        ]
+        if ultimo0 < c0 * 0.5 and n0 > 1:
+            linhas.append(f"  ^ bloco-toco de {ultimo0}f: passada inteira por pouco frame")
+        if custo0 > custo:
+            ganho = 100.0 * (custo0 - custo) / float(custo0)
+            linhas.append("")
+            linhas.append(f"ganho estimado: {ganho:.0f}% menos tempo no sampler")
+
+        relatorio = "\n".join(linhas)
+        print(f"[Bruxos ChunkPlanner] {total}f -> chunk {chunk} ov {ov} = {n} bloco(s) "
+              f"(custo {custo}f, antes {custo0}f)", flush=True)
+        return (int(chunk), int(ov), int(n), relatorio)
+
+
+BruxosChunkPlanner.DESCRIPTION = (
+    "Calculadora de chunk/overlap para o Bernini Infinity (e qualquer node que fatie video).\n"
+    "Escolhe valores que cobrem o video EXATAMENTE, sem deixar um ultimo bloco curto -- "
+    "que custa uma passada inteira do modelo e ainda gera pior por ter pouco contexto temporal.\n"
+    "Ex.: 162 frames com chunk 81 e overlap 8 viram 3 blocos (81, 81 e 16). "
+    "Com overlap 0 viram 2 blocos de 81, exatos: 33% menos tempo.\n"
+    "Saidas chunk_size e overlap ligam direto nas entradas de mesmo nome."
+)
+
+NODE_CLASS_MAPPINGS["BruxosChunkPlanner"] = BruxosChunkPlanner
+NODE_DISPLAY_NAME_MAPPINGS["BruxosChunkPlanner"] = "Chunk Planner (Bruxos)"

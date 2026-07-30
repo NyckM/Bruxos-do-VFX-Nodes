@@ -48,6 +48,10 @@ _merge("bruxos_wan_upscale")  # Wan Tiled Upscale: substitui o MM_Upscale (tiles
 _merge("bruxos_prompt_source")  # Prompt Source: switch manual / Qwen-VL / Florence2 -> STRING
 _merge("bruxos_tracked_crop")  # Tracked Crop/Stitch: janela que segue o objeto do SAM3 (crop -> upscale -> stitch)
 _merge("bruxos_ultimate_upscale")  # Ultimate Upscale Video: ESRGAN + UltimateSD + batching num node (rapido)
+_merge("bruxos_auto_edit")  # AutoEdit: instrucao em linguagem natural -> alvo p/ SAM3 + prompt p/ Bernini, e mascara rastreada
+# CrossView Warp 3D / Angulos 3D (Bruxos): MOVIDO pra custom_nodes/BruxosCrossViewWarp3D
+# (pacote proprio) -- estava dando incompatibilidade junto com o resto do pacote grande.
+# NAO reativar o merge aqui, senao registra o node DUAS vezes (conflito de NODE_CLASS_MAPPINGS).
 
 # ---- rota HTTP que serve os presets do Prompt Guide p/ a extensao JS ----
 try:

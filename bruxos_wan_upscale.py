@@ -226,7 +226,7 @@ class BruxosWanTiledUpscale:
                 "tile_overlap": ("INT", {"default": 8, "min": 1, "max": 64, "step": 1,
                     "tooltip": "Sobreposicao dos tiles em LATENTE (1~8px)."}),
                 # ---- JANELA TEMPORAL ----
-                "chunk_size": ("INT", {"default": 81, "min": 0, "max": 1024, "step": 4,
+                "chunk_size": ("INT", {"default": 81, "min": 0, "max": 1024, "step": 1,
                     "tooltip": "Frames por janela temporal (substitui o batch de 81). 0 = video inteiro de uma vez. Use 4n+1 (49/81). Menor = menos VRAM, mais janelas."}),
                 "overlap_frames": ("INT", {"default": 8, "min": 0, "max": 128, "step": 1,
                     "tooltip": "Frames de sobreposicao entre janelas pro crossfade (sem emenda). 8-16 e bom."}),
