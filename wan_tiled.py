@@ -31,6 +31,7 @@ import logging
 
 try:
     import torch
+    import torch.nn.functional as F
     _HAS_TORCH = True
 except Exception:
     _HAS_TORCH = False
@@ -84,6 +85,70 @@ def _tile_plan(H, W, rows, cols, overlap):
     return specs
 
 
+def _attach_custom_fades(specs):
+    """Calcula fades por borda para retangulos arbitrarios sobrepostos."""
+    for a in specs:
+        a["ft"] = a["fb"] = a["fl"] = a["fr"] = 0
+        acx = (a["x0"] + a["x1"]) * 0.5
+        acy = (a["y0"] + a["y1"]) * 0.5
+        for b in specs:
+            if a is b:
+                continue
+            ix0, iy0 = max(a["x0"], b["x0"]), max(a["y0"], b["y0"])
+            ix1, iy1 = min(a["x1"], b["x1"]), min(a["y1"], b["y1"])
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            bcx = (b["x0"] + b["x1"]) * 0.5
+            bcy = (b["y0"] + b["y1"]) * 0.5
+            if bcx < acx:
+                a["fl"] = max(a["fl"], ix1 - a["x0"])
+            elif bcx > acx:
+                a["fr"] = max(a["fr"], a["x1"] - ix0)
+            if bcy < acy:
+                a["ft"] = max(a["ft"], iy1 - a["y0"])
+            elif bcy > acy:
+                a["fb"] = max(a["fb"], a["y1"] - iy0)
+    return specs
+
+
+def _custom_tile_plan(H, W, layout, overlap):
+    """Converte retangulos normalizados do editor para o grid latente."""
+    raw = layout.get("tiles", []) if isinstance(layout, dict) else []
+    if not raw:
+        raise ValueError("layout custom sem tiles")
+    specs = []
+    ov = max(0, int(overlap))
+    for index, tile in enumerate(raw[:24]):
+        x0 = int(math.floor(float(tile["x0"]) * W))
+        y0 = int(math.floor(float(tile["y0"]) * H))
+        x1 = int(math.ceil(float(tile["x1"]) * W))
+        y1 = int(math.ceil(float(tile["y1"]) * H))
+        # O overlap do node expande apenas bordas internas. Assim layouts que
+        # se encostam ganham uma faixa real de fusao sem ultrapassar o canvas.
+        if x0 > 0: x0 -= ov
+        if y0 > 0: y0 -= ov
+        if x1 < W: x1 += ov
+        if y1 < H: y1 += ov
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(W, x1), min(H, y1)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        specs.append({
+            "row": index, "col": 0, "id": tile.get("id", index + 1),
+            "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+            "weight": max(0.05, min(8.0, float(tile.get("weight", 1.0)))),
+        })
+    if not specs:
+        raise ValueError("layout custom nao produziu tiles validos")
+    cover = torch.zeros((H, W), dtype=torch.bool)
+    for s in specs:
+        cover[s["y0"]:s["y1"], s["x0"]:s["x1"]] = True
+    if not bool(cover.all()):
+        missing = int((~cover).sum())
+        raise ValueError(f"layout custom deixou {missing} celula(s) latentes sem cobertura")
+    return _attach_custom_fades(specs)
+
+
 def _win1d(size, fade_a, fade_b, device, dtype, mode="hann"):
     """Janela 1D com subida/descida COMPLEMENTAR: duas janelas vizinhas somam 1
     exatamente na sobreposicao -> emenda invisivel por construcao."""
@@ -109,13 +174,9 @@ def _win2d(spec, device, dtype, mode="hann"):
 
 # ---------------------------------------------------------------------------
 # recorte do conditioning
-# IMPORTANTE (bug corrigido): o context_latents do Bernini/Wan NAO pode ser
-# recortado. Ele e um stream de REFERENCIA com posicoes proprias (RoPE): se o
-# modelo recebe so um pedaco, ele o trata como o quadro INTEIRO de referencia
-# e reproduz o shot todo dentro de cada ladrilho (mosaico de copias). O certo
-# e: cada ladrilho gera o seu pedaco VENDO a referencia inteira.
-# So recortamos tensores que sao ESPACIALMENTE COLADOS ao latente de geracao
-# (mask/noise_mask/concat_latent_image), nunca os streams de referencia.
+# O contexto 0 do Bernini e o video-fonte espacialmente alinhado ao latent de
+# geracao. Ele acompanha o recorte de cada tile. Os contextos posteriores
+# (tail/reference_video/imagens) seguem global, local ou hybrid.
 # ---------------------------------------------------------------------------
 _BX_NEVER_CROP = {"context_latents", "reference_latents", "pooled_output"}
 _BX_CROP_KEYS = {"mask", "noise_mask", "concat_latent_image", "concat_mask", "denoise_mask"}
@@ -136,7 +197,70 @@ def _crop_val(v, s, H, W):
     return v
 
 
-def _crop_cond_list(cond, s, H, W):
+def _reference_tile(t, s, H, W, mode):
+    """Contexto de referencia local ou hibrido, sem criar um stream extra.
+
+    O hibrido mistura o recorte detalhado com uma miniatura low-frequency da
+    referencia inteira. Assim preserva composicao/identidade global sem mudar a
+    quantidade/ordem dos context_latents (image0 continua sendo image0).
+    """
+    if not torch.is_tensor(t) or t.dim() < 4 or mode == "global":
+        return t
+    rh, rw = int(t.shape[-2]), int(t.shape[-1])
+    x0 = max(0, min(rw - 1, int(math.floor(s["x0"] * rw / float(W)))))
+    y0 = max(0, min(rh - 1, int(math.floor(s["y0"] * rh / float(H)))))
+    x1 = max(x0 + 1, min(rw, int(math.ceil(s["x1"] * rw / float(W)))))
+    y1 = max(y0 + 1, min(rh, int(math.ceil(s["y1"] * rh / float(H)))))
+    local = t[..., y0:y1, x0:x1].contiguous()
+    if mode != "hybrid":
+        return local
+
+    # Ancora global barata: reduz primeiro a no maximo 16x16 latentes para
+    # remover detalhe fino, depois encaixa no tile e mistura 20%.
+    lh, lw = int(local.shape[-2]), int(local.shape[-1])
+    prefix = tuple(t.shape[:-2])
+    flat = t.reshape(-1, 1, rh, rw).float()
+    scale = min(1.0, 16.0 / max(1, rh), 16.0 / max(1, rw))
+    ah, aw = max(1, round(rh * scale)), max(1, round(rw * scale))
+    anchor = F.interpolate(flat, size=(ah, aw), mode="area")
+    anchor = F.interpolate(anchor, size=(lh, lw), mode="bilinear", align_corners=False)
+    anchor = anchor.reshape(*prefix, lh, lw).to(dtype=local.dtype)
+    return (local * 0.80 + anchor * 0.20).contiguous()
+
+
+def _crop_contexts(value, s, H, W, mode="global"):
+    """Fonte primaria sempre local; referencias seguem global/local/hybrid."""
+    if not isinstance(value, (list, tuple)) or not value:
+        return value
+    out = list(value)
+    first = out[0]
+    if torch.is_tensor(first) and first.dim() >= 4 and tuple(first.shape[-2:]) == (H, W):
+        out[0] = first[..., s["y0"]:s["y1"], s["x0"]:s["x1"]].contiguous()
+    if mode in ("local", "hybrid"):
+        for i in range(1, len(out)):
+            out[i] = _reference_tile(out[i], s, H, W, mode)
+    return out
+
+
+def _primary_context_status(conds, H, W):
+    """Retorna (tem_contexto, contexto_0_alinhado_ao_canvas)."""
+    for item in conds or []:
+        d = item if isinstance(item, dict) else (
+            item[1] if isinstance(item, (list, tuple)) and len(item) > 1 and isinstance(item[1], dict) else {}
+        )
+        ctx = d.get("context_latents")
+        if ctx is None or (isinstance(ctx, (list, tuple)) and not ctx):
+            continue
+        first = ctx[0] if isinstance(ctx, (list, tuple)) else ctx
+        matched = bool(
+            torch.is_tensor(first) and first.dim() >= 4
+            and tuple(first.shape[-2:]) == (int(H), int(W))
+        )
+        return True, matched
+    return False, False
+
+
+def _crop_cond_list(cond, s, H, W, context_mode="global"):
     """Recorta APENAS as chaves espaciais coladas (mask etc.); referencia
     (context_latents e afins) passa INTACTA — o modelo precisa ve-la inteira."""
     if not cond:
@@ -146,14 +270,20 @@ def _crop_cond_list(cond, s, H, W):
         if isinstance(item, dict):
             d = {}
             for k, v in item.items():
-                d[k] = _crop_val(v, s, H, W) if k in _BX_CROP_KEYS else v
+                if k == "context_latents":
+                    d[k] = _crop_contexts(v, s, H, W, context_mode)
+                else:
+                    d[k] = _crop_val(v, s, H, W) if k in _BX_CROP_KEYS else v
             out.append(d)
         else:
             t = item[0]
             d0 = item[1] if len(item) > 1 and isinstance(item[1], dict) else {}
             d = {}
             for k, v in d0.items():
-                d[k] = _crop_val(v, s, H, W) if k in _BX_CROP_KEYS else v
+                if k == "context_latents":
+                    d[k] = _crop_contexts(v, s, H, W, context_mode)
+                else:
+                    d[k] = _crop_val(v, s, H, W) if k in _BX_CROP_KEYS else v
             out.append([t, d])
     return out
 
@@ -163,13 +293,17 @@ if _samplers is not None and hasattr(_samplers, "CFGGuider"):
     class _WanTiledGuider(_samplers.CFGGuider):
         """Prediz o ruido por ladrilho e FUNDE a cada passo de denoise."""
 
-        def set_tiling(self, rows, cols, overlap, blend, cleanup, debug):
+        def set_tiling(self, rows, cols, overlap, blend, cleanup, debug, layout=None,
+                       context_mode="global"):
             self._rows, self._cols = int(rows), int(cols)
             self._ovl = int(overlap)
             self._blend = blend
             self._cleanup = bool(cleanup)
             self._debug = bool(debug)
+            self._layout = layout if isinstance(layout, dict) and layout.get("tiles") else None
+            self._context_mode = str(context_mode) if str(context_mode) in ("global", "local", "hybrid") else "global"
             self._logged = False
+            self._ctx_warned = False
 
         def predict_noise(self, x, timestep, model_options={}, seed=None):
             rows = getattr(self, "_rows", 1)
@@ -178,31 +312,23 @@ if _samplers is not None and hasattr(_samplers, "CFGGuider"):
             if (rows <= 1 and cols <= 1) or x.dim() < 4:
                 return super().predict_noise(x, timestep, model_options, seed)
 
-            # LIMITACAO CONHECIDA (honesta): com context_latents (Bernini/Wan
-            # V2V), o ladrilho espacial perde a POSICAO — o RoPE do pedaco
-            # comeca em (0,0) e o modelo reproduz a referencia inteira dentro
-            # de cada tile (mosaico de copias). Ate existir suporte a posicao
-            # no motor, o tiled so vale p/ geracao SEM streams de referencia
-            # (T2V puro). Detectamos e caimos pro caminho normal, avisando.
+            # O target e o contexto-fonte precisam usar o mesmo recorte local.
+            # Se o contexto 0 nao casar com o canvas, desliga o tiled com
+            # seguranca em vez de produzir um mosaico de copias.
+            H, W = int(x.shape[-2]), int(x.shape[-1])
             pos = self.conds.get("positive") or []
-            has_ctx = False
-            for item in pos:
-                d = item if isinstance(item, dict) else (item[1] if len(item) > 1 and isinstance(item[1], dict) else {})
-                if d.get("context_latents"):
-                    has_ctx = True
-                    break
-            if has_ctx:
+            has_ctx, primary_matches = _primary_context_status(pos, H, W)
+            if has_ctx and not primary_matches:
                 if not getattr(self, "_ctx_warned", False):
                     self._ctx_warned = True
                     print("[Bruxos Wan Tiled] context_latents detectado (video-fonte/refs): "
-                          "o ladrilho espacial NAO preserva a posicao com streams de referencia "
-                          "(sairia um mosaico de copias). Rodando SEM ladrilho neste passo. "
-                          "P/ resolucao maior com V2V, use o modo bbox ou reducao de chunk.",
+                          "o contexto 0 nao possui o mesmo grid espacial do latent de geracao. "
+                          "Rodando SEM ladrilho para evitar quadrantes repetidos.",
                           flush=True)
                 return super().predict_noise(x, timestep, model_options, seed)
 
-            H, W = int(x.shape[-2]), int(x.shape[-1])
-            specs = _tile_plan(H, W, rows, cols, self._ovl)
+            custom = getattr(self, "_layout", None)
+            specs = _custom_tile_plan(H, W, custom, self._ovl) if custom else _tile_plan(H, W, rows, cols, self._ovl)
             if len(specs) <= 1:
                 return super().predict_noise(x, timestep, model_options, seed)
 
@@ -210,9 +336,16 @@ if _samplers is not None and hasattr(_samplers, "CFGGuider"):
                 self._logged = True
                 th = specs[0]["y1"] - specs[0]["y0"]
                 tw = specs[0]["x1"] - specs[0]["x0"]
-                print(f"[Bruxos Wan Tiled] latente {W}x{H} -> {len(specs)} ladrilho(s) "
-                      f"de {tw}x{th} (overlap {self._ovl}) | fusao a cada passo",
+                context_info = (f" | fonte context[0] local; tail/refs {self._context_mode}"
+                                if has_ctx else "")
+                layout_name = "custom" if custom else f"{cols}x{rows}"
+                print(f"[Bruxos Wan Tiled] latente {W}x{H} -> {len(specs)} ladrilho(s) [{layout_name}] "
+                      f"de {tw}x{th} (overlap {self._ovl}) | fusao a cada passo{context_info}",
                       flush=True)
+                if has_ctx:
+                    print(f"[Bruxos Wan Tiled] tile_context_mode={self._context_mode} "
+                          f"(fonte local; refs {'inteiras' if self._context_mode == 'global' else 'por tile'})",
+                          flush=True)
 
             conds_full = self.conds                       # guarda o original
             acc = torch.zeros_like(x, dtype=torch.float32)
@@ -222,10 +355,12 @@ if _samplers is not None and hasattr(_samplers, "CFGGuider"):
                 for s in specs:
                     xt = x[..., s["y0"]:s["y1"], s["x0"]:s["x1"]].contiguous()
                     # o conditioning TEM que ver o mesmo pedaco
-                    self.conds = {k: _crop_cond_list(v, s, H, W) for k, v in conds_full.items()}
+                    self.conds = {k: _crop_cond_list(v, s, H, W, self._context_mode)
+                                  for k, v in conds_full.items()}
                     pred = super().predict_noise(xt, timestep, model_options, seed)
 
                     win = _win2d(s, x.device, torch.float32, self._blend)
+                    win = win * float(s.get("weight", 1.0))
                     acc[..., s["y0"]:s["y1"], s["x0"]:s["x1"]] += pred.float() * win
                     wsum[..., s["y0"]:s["y1"], s["x0"]:s["x1"]] += win
 
@@ -270,6 +405,11 @@ class BruxosWanTiledGuider:
                     "tooltip": "Esvazia o cache da VRAM depois de CADA ladrilho. Deixe LIGADO -- e o que faz caber na memoria."}),
                 "debug": ("BOOLEAN", {"default": False,
                     "tooltip": "Imprime o plano dos ladrilhos no console."}),
+                "tile_layout": ("BRUXOS_TILE_LAYOUT", {"tooltip":
+                    "Layout livre vindo do Bernini Custom Tile Layout. Substitui tile_count_width/height."}),
+                "tile_context_mode": (["hybrid", "local", "global"], {"default": "hybrid", "tooltip":
+                    "Como tratar tail/referencias no tiled. global=inteiras em todo tile (mais lento); "
+                    "local=recorte proporcional; hybrid=recorte local + 20% de ancora global reduzida."}),
             },
         }
 
@@ -291,7 +431,8 @@ class BruxosWanTiledGuider:
     )
 
     def build(self, model, positive, negative, tile_count_width, tile_count_height, cfg,
-              overlap=8, blend_mode="hann", limpar_vram=True, debug=False):
+              overlap=8, blend_mode="hann", limpar_vram=True, debug=False, tile_layout=None,
+              tile_context_mode="hybrid"):
         if _samplers is None or not hasattr(_samplers, "CFGGuider"):
             raise RuntimeError("[Bruxos Wan Tiled] comfy.samplers.CFGGuider nao encontrado neste build.")
 
@@ -299,14 +440,17 @@ class BruxosWanTiledGuider:
         g.set_conds(positive, negative)
         g.set_cfg(float(cfg))
         g.set_tiling(int(tile_count_height), int(tile_count_width), int(overlap),
-                     str(blend_mode), bool(limpar_vram), bool(debug))
+                     str(blend_mode), bool(limpar_vram), bool(debug), tile_layout,
+                     tile_context_mode)
 
-        n = int(tile_count_width) * int(tile_count_height)
+        n = len(tile_layout.get("tiles", [])) if isinstance(tile_layout, dict) else int(tile_count_width) * int(tile_count_height)
         if n <= 1:
             info = "1x1 -> ladrilho DESLIGADO (roda o quadro inteiro, normal)"
         else:
-            info = (f"{tile_count_width}x{tile_count_height} = {n} ladrilho(s) | overlap {overlap} "
-                    f"latentes (~{overlap * 8}px) | {blend_mode} | cfg {cfg} | fusao a cada passo")
+            label = "custom" if isinstance(tile_layout, dict) else f"{tile_count_width}x{tile_count_height}"
+            info = (f"{label} = {n} ladrilho(s) | overlap {overlap} "
+                    f"latentes (~{overlap * 8}px) | {blend_mode} | cfg {cfg} | "
+                    f"contexto {tile_context_mode} | fusao a cada passo")
         print(f"[Bruxos Wan Tiled] {info}", flush=True)
         return (g, info)
 

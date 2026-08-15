@@ -115,7 +115,7 @@ def _encode_temp(images, fps, prefix, maxside=PREVIEW_MAXSIDE):
         import imageio
         with imageio.get_writer(path, fps=fps, codec="libx264",
                                 quality=7, macro_block_size=None,
-                                ffmpeg_params=["-pix_fmt", "yuv420p"]) as w:
+                                pixelformat="yuv420p") as w:
             for fr in _iter_uint8_frames(images, out_w, out_h):
                 w.append_data(fr)
         return {"filename": name, "subfolder": "", "type": "temp", "format": "video/mp4"}
@@ -164,9 +164,65 @@ class BruxosVideoCompare:
                    "adiante em resolução total. Codificação frame a frame (baixa RAM). "
                    "Tem botão para abrir no navegador.")
 
+    @staticmethod
+    def _stats(images, rotulo):
+        """Diagnostico do PRETO: mede o conteudo REAL do lote que chegou.
+        Se aqui ja vier tudo ~0, o problema esta ANTES deste node (o video que
+        entrou e preto mesmo). Se vier com conteudo e o preview aparecer preto,
+        o problema e na codificacao/reproducao do mp4."""
+        try:
+            x = images
+            n = int(x.shape[0])
+            amostra = x[:: max(1, n // 8)][:8]
+            if hasattr(amostra, "detach"):
+                amostra = amostra.detach().cpu().float()
+                mn, mx, md = float(amostra.min()), float(amostra.max()), float(amostra.mean())
+            else:
+                a = np.asarray(amostra, dtype=np.float32)
+                mn, mx, md = float(a.min()), float(a.max()), float(a.mean())
+            alerta = ""
+            if mx <= 0.02:
+                alerta = "  <== TODO PRETO JA NA ENTRADA (o problema esta antes deste node)"
+            elif md <= 0.02:
+                alerta = "  <== quase todo preto"
+            logging.info(f"[Bruxos Compare] {rotulo}: {n} frames {int(x.shape[2])}x{int(x.shape[1])} | "
+                         f"min={mn:.4f} max={mx:.4f} media={md:.4f}{alerta}")
+            print(f"[Bruxos Compare] {rotulo}: {n} frames {int(x.shape[2])}x{int(x.shape[1])} | "
+                  f"min={mn:.4f} max={mx:.4f} media={md:.4f}{alerta}", flush=True)
+            return mx
+        except Exception as e:
+            print(f"[Bruxos Compare] nao consegui medir {rotulo}: {e}", flush=True)
+            return None
+
     def compare(self, video_a, video_b, fps=24.0, preview_maxside=PREVIEW_MAXSIDE):
+        mx_a = self._stats(video_a, "A")
+        mx_b = self._stats(video_b, "B")
+
         ref_a = _encode_temp(video_a, fps, "bruxos_cmp_a", maxside=preview_maxside)
         ref_b = _encode_temp(video_b, fps, "bruxos_cmp_b", maxside=preview_maxside)
+
+        # confere se os mp4 sairam com tamanho plausivel (arquivo minusculo =
+        # encode falhou silenciosamente e o <video> mostra preto)
+        try:
+            tmp = folder_paths.get_temp_directory()
+            for r, rot in ((ref_a, "A"), (ref_b, "B")):
+                p = os.path.join(tmp, r["filename"])
+                kb = os.path.getsize(p) / 1024.0 if os.path.exists(p) else -1
+                if kb < 0:
+                    print(f"[Bruxos Compare] ERRO: o mp4 de {rot} nao foi criado ({p}).", flush=True)
+                elif kb < 8:
+                    print(f"[Bruxos Compare] ATENCAO: mp4 de {rot} tem so {kb:.1f} KB -- o encode provavelmente "
+                          f"falhou e o preview vai aparecer PRETO. Instale/atualize o imageio-ffmpeg.", flush=True)
+                else:
+                    print(f"[Bruxos Compare] mp4 de {rot}: {kb:.0f} KB", flush=True)
+        except Exception:
+            pass
+
+        if (mx_a is not None and mx_a <= 0.02) and (mx_b is not None and mx_b <= 0.02):
+            print("[Bruxos Compare] >>> OS DOIS lotes chegaram PRETOS. Este node so mostra o que recebe -- "
+                  "olhe o node que alimenta o video_a/video_b (sampler que falhou, VAE/latente incompativel, "
+                  "denoise/cfg zerando a imagem).", flush=True)
+
         logging.info(f"[Bruxos Compare] A={ref_a['filename']} B={ref_b['filename']} fps={fps}")
         return {"ui": {"bruxos_compare": [{"a": ref_a, "b": ref_b, "fps": float(fps)}]},
                 "result": (video_a,)}

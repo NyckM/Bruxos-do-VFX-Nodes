@@ -4,7 +4,7 @@ ComfyUI-Bruxos-do-VFX — Prompt Guide
 Inspirado no "Bernini Prompt Guide" do Deno: um encoder de CLIP que guarda
 'system prompts' por tarefa (cada opcao e um comando pro modelo) e negativos
 oficiais por modelo. Aqui com mais modelos: Bernini, Wan 2.2, Wan 2.1,
-LTX 2.3 (Edit Anything LoRA) e Seedance 2.
+LTX 2.3 (Edit Anything LoRA), MiniMax H3 e Seedance 2.
 
 Tudo e editavel: ao escolher um modelo + tarefa, o system prompt do preset e
 usado (e auto-preenchido pela extensao JS); se voce digitar algo no campo de
@@ -157,6 +157,43 @@ PRESETS = {
         "default_negative": "LTX default",
     },
     # =====================================================================
+    # MiniMax H3 — use a saida positive_text no input prompt do H3.
+    # Para macros @/# ou Context-IR, ligue esse texto em prompt_in e desligue
+    # prepend_system para nao alterar a representacao ja pronta.
+    "MiniMax H3": {
+        "tasks": {
+            "Default": "",
+            "Text to Video": (
+                "Create one continuous coherent video shot. Describe the subject, action, environment, "
+                "camera, lighting and sound concretely. Preserve identities, spatial layout and visual "
+                "continuity throughout the shot."
+            ),
+            "Image to Video": (
+                "Use <Image 1> as the first-frame visual anchor. Preserve subject identity, clothing, "
+                "composition and scene geometry while adding natural motion, camera behavior and sound."
+            ),
+            "Reference to Video": (
+                "Use <Image 1> as the visual reference. Preserve its subject identity, appearance, materials "
+                "and style consistently while following the requested action, camera and environment."
+            ),
+            "Video Edit": (
+                "Edit <Video 1> according to the request while preserving timing, camera trajectory, subject "
+                "identity, motion and all unspecified scene content. Keep the result temporally stable."
+            ),
+            "Style: Style Transfer": (
+                "Apply the requested visual style consistently to the entire shot while preserving source "
+                "composition, subject identity, movement, camera motion and scene geometry. Avoid duplicated "
+                "subjects, abrupt style changes and shot changes."
+            ),
+            "Cinematic": (
+                "Create one continuous cinematic shot with physically plausible motion, coherent staging, "
+                "filmic lighting, controlled depth of field, natural color and synchronized environmental sound."
+            ),
+        },
+        "negatives": {"None": ""},
+        "default_negative": "None",
+    },
+    # =====================================================================
     # Seedance 2 — presets genericos (pontos de partida; ajuste ao seu fluxo).
     "Seedance 2": {
         "tasks": {
@@ -215,7 +252,7 @@ def _encode(clip, text):
 
 
 class BruxosPromptGuide:
-    """Guia de prompts multimodelo (Bernini / Wan / LTX / Seedance) com presets."""
+    """Guia de prompts multimodelo (Bernini / Wan / LTX / H3 / Seedance) com presets."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -250,7 +287,7 @@ class BruxosPromptGuide:
     DESCRIPTION = (
         "Prompt Guide (Bruxos) — encoder com presets de comando por modelo, no estilo do "
         "Bernini Prompt Guide do Deno, mas multimodelo: Bernini, Wan 2.2, Wan 2.1, "
-        "LTX 2.3 (Edit Anything) e Seedance 2.\n"
+        "LTX 2.3 (Edit Anything), MiniMax H3 e Seedance 2.\n"
         "- model: escolhe o modelo (filtra as tarefas e negativos).\n"
         "- task: o comando/tarefa; cada um traz um system prompt proprio.\n"
         "- negative_preset: negativo pronto (ex: Official Wan2.2 oficial em chines/EN).\n"

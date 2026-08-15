@@ -48,7 +48,36 @@ _merge("bruxos_wan_upscale")  # Wan Tiled Upscale: substitui o MM_Upscale (tiles
 _merge("bruxos_prompt_source")  # Prompt Source: switch manual / Qwen-VL / Florence2 -> STRING
 _merge("bruxos_tracked_crop")  # Tracked Crop/Stitch: janela que segue o objeto do SAM3 (crop -> upscale -> stitch)
 _merge("bruxos_ultimate_upscale")  # Ultimate Upscale Video: ESRGAN + UltimateSD + batching num node (rapido)
+_merge("minimax_encode_bruxos")  # [LEGADO] MinimaxDaBruxos Encode/Decode -- so delega pro minimax_h3_bruxos (mantido p/ nao quebrar grafos)
 _merge("bruxos_auto_edit")  # AutoEdit: instrucao em linguagem natural -> alvo p/ SAM3 + prompt p/ Bernini, e mascara rastreada
+_merge("minimax_h3_bruxos")  # MiniMax H3: video real -> latente (audio+video) p/ denoise controlado + inspetor de LATENT
+_merge("minimax_h3_mask_bruxos")  # MiniMax H3: outpaint (expandir quadro + mascara) e mascara -> noise_mask do latente (inpaint)
+_merge("bruxos_composite_refine")  # Composite & Refine: cola imagem de referencia no video + mascara (p/ modelos sem entrada de referencia)
+_merge("bruxos_chromakey")  # Chromakey/luma/matte externo: recorte, despill e composicao do fundo de referencia + mascara
+_merge("bruxos_qwen3_enhancer")  # Prompt Enhancer Qwen3 com os parametros oficiais (thinking/non-thinking)
+_merge("bruxos_h3_context_ir")  # H3 Context-IR local: ideia solta -> as 6 secoes estruturadas que o H3-Base espera
+_merge("bruxos_h3_cond_forca")  # H3: forca do condicionamento (minimax_*_cond_noise_aug) -- nenhum node de fabrica escreve nisso
+_merge("bruxos_h3_prompt_rapido")  # H3 Prompt Rapido: macros @ e # -> tags do H3, sem LLM (ideia do ComfyUI-MiniMaxH3-Easy, MIT)
+_merge("bruxos_h3_frames")  # H3 Frames: grade valida (length %17==5, o "4n+1" do H3) + casa a referencia no tamanho
+_merge("bruxos_h3_latent_upscale")  # H3 2-pass: escala o latente entre samplers + reescala as refs do condicionamento
+_merge("bruxos_h3_loader")  # H3 Loader: transformer + text encoder + os DOIS VAEs num node so
+_merge("bruxos_idv2v_condition")  # ID-V2V: sinal de controle foreground-on-gray (SAM3) pro control_video do VACE
+_merge("bruxos_mask_bbox")  # Mascara -> BBox -> recorta / gera / cola de volta (o H3 NAO tem entrada de mascara)
+_merge("bruxos_video_tiler")  # Video Tiler: ladrilho em pixel p/ upscale (LTX / H3) + ref por ladrilho + fusao + color match + disco
+_merge("bruxos_seam_aware_merge")  # alinhamento + emenda de menor erro, sem dupla exposicao no overlap
+_merge("bruxos_disk_stream")  # Cache de frames no SSD: decode direto + janelas + prefetch assincrono
+_merge("bruxos_h3_rolling_memory")  # H3 em blocos de 124: tail 56 + memorias visuais persistentes entre filas
+_merge("bruxos_h3_contex_loop")  # ponte tile-aware: SSD/tiles Bruxos + Motion Context/loop/checkpoints GPL
+_merge("bruxos_h3_latent_ssd")  # H3 AV: tail latente no SSD, refs sem VAE roundtrip, split/pack/join corretos
+_merge("bernini_ssd_81")  # Bernini em blocos de 81: fonte + tail no SSD entre filas
+_merge("bruxos_temporal_anchors")  # 41 frames clay como ancoras espalhadas numa saida Bernini de 81
+_merge("bruxos_h3_clay_reference")  # H3: imagem alta + clay leve em resolucao e ancoras temporais
+_merge("bruxos_h3_row_chunk")  # H3: QKV/MLP em blocos de linhas, menor pico e sem limite int32 (Nynxz, MIT)
+_merge("bruxos_h3_reference_isolate")  # H3: referencias nao atendem o alvo; alvo ainda ve referencias (Nynxz, MIT)
+_merge("bruxos_tile_layout")  # editor visual -> layout custom do tiled Bernini/Wan
+_merge("bruxos_motion")  # timeline/mask/hold-map + time-smear para movimento rapido
+_merge("bruxos_flux2_klein_fill")  # green-screen LoRA: inpaint/outpaint FLUX.2 Klein nativo
+_merge("bruxos_h3_face_refine")  # rosto pequeno: crop estabilizado + denoise temporal preservando audio
 # CrossView Warp 3D / Angulos 3D (Bruxos): MOVIDO pra custom_nodes/BruxosCrossViewWarp3D
 # (pacote proprio) -- estava dando incompatibilidade junto com o resto do pacote grande.
 # NAO reativar o merge aqui, senao registra o node DUAS vezes (conflito de NODE_CLASS_MAPPINGS).
@@ -62,6 +91,67 @@ try:
     @PromptServer.instance.routes.get("/bruxos/prompt_presets")
     async def _bruxos_prompt_presets(request):  # pragma: no cover
         return web.json_response(presets_payload())
+
+    # ---- catalogo das macros # e @ do Prompt Rapido do H3 ----
+    # Serve o proprio _BLOCOS: o popup nunca fica dessincronizado do node.
+    @PromptServer.instance.routes.get("/bruxos/h3_macros")
+    async def _bruxos_h3_macros(request):  # pragma: no cover
+        from .bruxos_h3_prompt_rapido import macros_payload
+        return web.json_response(macros_payload())
+
+    # ---- miniatura do primeiro frame para a galeria do Load Video ---------
+    @PromptServer.instance.routes.get("/bruxos/video_thumbnail")
+    async def _bruxos_video_thumbnail(request):  # pragma: no cover
+        import os, asyncio, hashlib
+        import folder_paths
+
+        relative = str(request.query.get("filename", "")).replace("\\", "/").lstrip("/")
+        base = os.path.abspath(folder_paths.get_input_directory())
+        path = os.path.abspath(os.path.join(base, relative))
+        try:
+            inside_input = os.path.commonpath([base, path]) == base
+        except ValueError:
+            inside_input = False
+        if not inside_input or not os.path.isfile(path):
+            return web.json_response({"error": "arquivo invalido"}, status=400)
+
+        mtime = os.path.getmtime(path)
+        key = hashlib.md5(f"{path}|{mtime}|first-frame-v1".encode()).hexdigest()[:20]
+        thumb_dir = os.path.join(folder_paths.get_temp_directory(), "bruxos_video_thumbs")
+        os.makedirs(thumb_dir, exist_ok=True)
+        output = os.path.join(thumb_dir, f"{key}.jpg")
+
+        if not os.path.isfile(output):
+            def _make_thumbnail():
+                import cv2
+                capture = cv2.VideoCapture(path)
+                frame = None
+                # Alguns containers entregam um primeiro pacote vazio; tente
+                # poucos frames sem transformar a miniatura num decode longo.
+                for _ in range(8):
+                    ok, candidate = capture.read()
+                    if ok and candidate is not None and candidate.size:
+                        frame = candidate
+                        break
+                capture.release()
+                if frame is None:
+                    return False
+                height, width = frame.shape[:2]
+                scale = min(1.0, 320.0 / max(width, height))
+                if scale < 1.0:
+                    frame = cv2.resize(
+                        frame,
+                        (max(2, round(width * scale)), max(2, round(height * scale))),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                return bool(cv2.imwrite(output, frame, [cv2.IMWRITE_JPEG_QUALITY, 82]))
+
+            if not await asyncio.to_thread(_make_thumbnail):
+                return web.json_response({"error": "frame indisponivel"}, status=415)
+
+        response = web.FileResponse(output)
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
 
     # ---- preview JA CORTADO (estilo VHS advanced): re-renderiza o trecho ----
     @PromptServer.instance.routes.get("/bruxos/video_preview")
@@ -82,7 +172,7 @@ try:
         cap = max(0, _i("frame_load_cap", 0))
         nth = max(1, _i("select_every_nth", 1))
         rate = max(0.0, _f("force_rate", 0.0))
-        maxside = max(64, _i("maxside", 360))
+        maxside = max(64, _i("maxside", 720))
         try:
             if ftype == "output":
                 base = folder_paths.get_output_directory()
@@ -140,8 +230,8 @@ try:
                     try:
                         import imageio
                         with imageio.get_writer(out, fps=out_fps, codec="libx264",
-                                                quality=6, macro_block_size=None,
-                                                ffmpeg_params=["-pix_fmt", "yuv420p"]) as wr:
+                                                quality=8, macro_block_size=None,
+                                                pixelformat="yuv420p") as wr:
                             for fr in frames:
                                 wr.append_data(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB))
                         return True

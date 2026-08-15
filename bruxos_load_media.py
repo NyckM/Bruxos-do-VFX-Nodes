@@ -206,7 +206,7 @@ class BruxosLoadImage:
     @classmethod
     def INPUT_TYPES(cls):
         files = _list_input_images()
-        return {
+        inputs = {
             "required": {
                 "image": (files if files else ["(coloque imagens em ComfyUI/input)"],
                           {"tooltip": "Imagem da pasta ComfyUI/input. Use o botao de upload."}),
@@ -232,8 +232,32 @@ class BruxosLoadImage:
                     "tooltip": "Altura do box (0..1)."}),
                 "image_path": ("STRING", {"default": "",
                     "tooltip": "Caminho absoluto (tem prioridade sobre o seletor)."}),
+                # ---------------------------------------------------------
+                # APPEND-ONLY: widget NOVO vai no FIM. O ComfyUI casa os
+                # widgets_values salvos por ORDEM, nao por nome.
+                # ---------------------------------------------------------
+                "girar": (["off", "90 (horario)", "-90 (anti-horario)", "180"],
+                    {"default": "off", "tooltip":
+                    "Gira a imagem ANTES do fit/crop: girar troca largura por altura, e o box "
+                    "de corte precisa ser calculado ja na orientacao final.\n\n"
+                    "Serve para foto de celular que abre deitada -- o arquivo guarda o quadro "
+                    "na horizontal mais uma FLAG EXIF de rotacao, e quem ignora a flag entrega "
+                    "virado.\n\n"
+                    "A MASCARA gira junto. '-180' nao existe: e o mesmo que 180."}),
+                "flip_horizontal": ("BOOLEAN", {"default": False,
+                    "tooltip": "Espelha a imagem da esquerda para a direita. A mascara acompanha."}),
+                "flip_vertical": ("BOOLEAN", {"default": False,
+                    "tooltip": "Espelha a imagem de cima para baixo. A mascara acompanha."}),
             },
         }
+        # O frontend do ComfyUI cria o controle Hide/Show advanced inputs a
+        # partir deste metadado. Isso funciona tanto no renderer LiteGraph
+        # (Nodes 1.0) quanto no Vue (Nodes 2.0), sem inserir um widget extra em
+        # widgets_values e, portanto, sem deslocar valores de workflows salvos.
+        for spec in inputs["optional"].values():
+            if len(spec) > 1 and isinstance(spec[1], dict):
+                spec[1]["advanced"] = True
+        return inputs
 
     RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT")
     RETURN_NAMES = ("image", "mask", "width", "height")
@@ -243,13 +267,34 @@ class BruxosLoadImage:
                    "e modo fit: crop / stretch / pad. Preview em tempo real do recorte no node.")
 
     def load(self, image, fit_mode="off (original)", target_width=0, target_height=0,
-             aspect="livre", crop_x=0.0, crop_y=0.0, crop_w=1.0, crop_h=1.0, image_path=""):
+             aspect="livre", crop_x=0.0, crop_y=0.0, crop_w=1.0, crop_h=1.0, image_path="",
+             girar="off", flip_horizontal=False, flip_vertical=False):
         if not _OK:
             raise RuntimeError("[Bruxos Load Image] torch indisponivel neste build.")
         path = _resolve_image_path(image, image_path)
         rgb, mask = _read_image_rgba(path)
         img_t = torch.from_numpy(rgb).unsqueeze(0)          # [1,H,W,3]
         mask_t = torch.from_numpy(mask).unsqueeze(0)         # [1,H,W]
+
+        # ---- GIRO: antes do fit/crop, e a mascara vai junto ----
+        # rot90 k=1 e ANTI-HORARIO, entao horario e k=-1. Os rotulos dizem a
+        # direcao por extenso porque "90" sozinho e ambiguo entre ferramentas.
+        _g = str(girar or "off")
+        if not _g.startswith("off"):
+            _k = -1 if _g.startswith("90") else (1 if _g.startswith("-90") else 2)
+            antes = (int(img_t.shape[1]), int(img_t.shape[2]))
+            img_t = torch.rot90(img_t, _k, (1, 2)).contiguous()
+            mask_t = torch.rot90(mask_t, _k, (1, 2)).contiguous()
+            print(f"[Bruxos Load Image] girar {_g}: "
+                  f"{antes[1]}x{antes[0]} -> {img_t.shape[2]}x{img_t.shape[1]}", flush=True)
+
+        # ---- FLIP: ainda antes do crop/fit, exatamente como no preview ----
+        if bool(flip_horizontal):
+            img_t = torch.flip(img_t, dims=(2,)).contiguous()
+            mask_t = torch.flip(mask_t, dims=(2,)).contiguous()
+        if bool(flip_vertical):
+            img_t = torch.flip(img_t, dims=(1,)).contiguous()
+            mask_t = torch.flip(mask_t, dims=(1,)).contiguous()
 
         img_t, mask_t = _bx_apply_fit(
             img_t, mask_t, fit_mode,

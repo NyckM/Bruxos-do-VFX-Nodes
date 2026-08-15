@@ -1,0 +1,5 @@
+--- .gitignore (原始)
+
+
++++ .gitignore (修改后)
+Nothing should be ignored in this case, as the changes only include source code files (.py) and a .gitignore file itself. No build artifacts, dependencies, or temporary files are present in the change list.

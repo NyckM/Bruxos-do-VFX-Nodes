@@ -112,6 +112,22 @@ def _fmt_t(s):
     return f"{s:.1f}s" if s < 60 else f"{int(s // 60)}m{s - 60 * int(s // 60):04.1f}s"
 
 
+def _tile_anchor_image(image, width, height, mode="crop"):
+    """Primeiro frame da referencia no canvas exato do latent de geracao."""
+    x = image[:1, ..., :3].movedim(-1, 1).float()
+    sh, sw = int(x.shape[-2]), int(x.shape[-1])
+    W, H = int(width), int(height)
+    if mode == "stretch" or sh <= 0 or sw <= 0:
+        out = torch.nn.functional.interpolate(x, size=(H, W), mode="bilinear", align_corners=False)
+    else:
+        scale = max(W / float(sw), H / float(sh))
+        rw, rh = max(W, int(round(sw * scale))), max(H, int(round(sh * scale)))
+        resized = torch.nn.functional.interpolate(x, size=(rh, rw), mode="bilinear", align_corners=False)
+        x0, y0 = max(0, (rw - W) // 2), max(0, (rh - H) // 2)
+        out = resized[..., y0:y0 + H, x0:x0 + W]
+    return out.movedim(1, -1).contiguous().clamp(0, 1)
+
+
 class BruxosBerniniI2V:
     @classmethod
     def INPUT_TYPES(cls):
@@ -144,12 +160,12 @@ class BruxosBerniniI2V:
                 "reference_image_8": ("IMAGE", {"tooltip": "8a referencia (opcional). O Bernini aceita ate ~8 refs; mais que isso costuma nao ajudar e gasta mais VRAM. Cada IMAGE pode ter varios frames, e todos viram referencia."}),
                 "reference_video": ("IMAGE", {"tooltip": "Video de referencia (opcional). Vira contexto extra."}),
                 "teacache": ("BERNINI_TEACACHE", {"tooltip": "[experimental] Ligue a saida do node 'Bernini TeaCache (Bruxos)' aqui pra acelerar (1.5-2x) pulando blocos do transformer. So age com guidance_mode=off. Sem ligar = desligado. Teste com/sem e compare qualidade."}),
-                "guidance_mode": (["off", "multi", "tiled"], {"default": "off", "tooltip": "off = CFG normal (rapido). multi = guidance por stream (eq. 8-12) — LIGA 'reference_strength' pra FORCAR a referencia (~4x mais lento). tiled = LADRILHO no latente (igual ao Bernini Infinity). ATENCAO: o tiled se DESLIGA sozinho quando ha referencia (context_latents), que o i2v SEMPRE tem — entao no i2v ele so avisa e roda normal (nao tila). So tila de verdade em T2V puro (sem referencia). Exposto aqui pra ficar igual ao Infinity e voce testar."}),
+                "guidance_mode": (["off", "multi", "tiled"], {"default": "off", "tooltip": "off = CFG normal (rapido). multi = guidance por stream (~4x mais lento). tiled = divide o latent espacialmente; a primeira reference_image vira ancora alinhada e cada tile recebe uma parte diferente. Refs extras seguem tile_context_mode."}),
                 "reference_strength": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 30.0, "step": 0.05, "tooltip": "[guidance_mode=multi] Quanto FORCA a imagem de referencia. Maior = mais preso a ela (identidade/roupa/estilo). Paper: 1.25 (base) ate 3.0 (RV2V, referencia forte). Comece em 1.5-2.5. So tem efeito com guidance_mode=multi. Aplica aos dois streams de referencia (1a ref + refs extras)."}),
                 "ref_influence_vid_off": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 8.0, "step": 0.05, "tooltip": "[guidance_mode=off/tiled] Controla a influencia do VIDEO de referencia (reference_video) SEM o modo multi (4x mais lento) -- escala a magnitude do latente antes de virar contexto. 1.0 = neutro. Independente de ref_influence_img_off: suba um e desca o outro pra pender mais pro video ou mais pras imagens. EXPERIMENTAL -- comece em 1.5-2.5; 5+ tende a quebrar a imagem. Sem efeito no modo multi (la manda reference_strength)."}),
                 "ref_influence_img_off": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 8.0, "step": 0.05, "tooltip": "[guidance_mode=off/tiled] Controla a influencia das IMAGENS de referencia SEM o modo multi -- escala a magnitude do latente de cada imagem antes de virar contexto. 1.0 = neutro. Pra 'parecer mais com as imagens': suba este. Pra 'parecer mais com o video de referencia': suba o ref_influence_vid_off e desca este. EXPERIMENTAL -- comece em 1.5-2.5; 5+ tende a quebrar a imagem. Sem efeito no modo multi (la manda reference_strength)."}),
-                "tile_w": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1, "tooltip": "[guidance_mode=tiled] Colunas de ladrilho. 1 = nao corta na horizontal. So faz efeito com tiled E sem referencia (T2V)."}),
-                "tile_h": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1, "tooltip": "[guidance_mode=tiled] Linhas de ladrilho. So faz efeito com tiled E sem referencia (T2V)."}),
+                "tile_w": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1, "tooltip": "[guidance_mode=tiled] Colunas. Cada tile recebe a regiao correspondente da primeira reference_image."}),
+                "tile_h": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1, "tooltip": "[guidance_mode=tiled] Linhas. 2x2 gera quatro partes diferentes que completam o quadro."}),
                 "tile_overlap": ("INT", {"default": 8, "min": 1, "max": 64, "step": 1, "tooltip": "[guidance_mode=tiled] Sobreposicao entre ladrilhos, em latentes (1 ~ 8px)."}),
                 "mode": (["context_window", "sequential"], {"default": "context_window", "tooltip": "Como cortar o video no tempo (so importa com chunk_size>0). context_window = a cada passo de denoise roda TODAS as janelas e funde (mais coerente, mas o video inteiro fica na VRAM -> forca janelas pequenas em alta-res). sequential = processa UM BLOCO por vez, denoise completo, carregando os ultimos frames como memoria (tail) pro proximo -> MUITO menos VRAM, entao voce pode usar chunk GRANDE (49/81) mesmo em 1080p = poucas janelas grandes = mais rapido no nativo pesado. Comece com context_window; troque pra sequential se em alta-res o chunk pequeno gerar janelas demais."}),
                 "chunk_size": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 4, "tooltip": "[JANELA TEMPORAL — anti-cliff em alta resolucao] Tamanho da janela/bloco em FRAMES. 0 = desligado (video inteiro = atencao global). CONTRAINTUITIVO: chunk MAIOR = MENOS janelas = mais rapido (ate o limite de VRAM). Nao use valores pequenos tipo 12 (gera janelas demais). Use 4n+1 (25,33,49,81). 720p context_window: ~33. 1080p: use mode=sequential + chunk 49/81."}),
@@ -158,6 +174,11 @@ class BruxosBerniniI2V:
                 "limpar_vram": (["off", "leve", "agressivo"], {"default": "leve", "tooltip": "Limpeza de VRAM entre o high e o low (igual ao Bernini Infinity)."}),
                 "force_unload_between_passes": ("BOOLEAN", {"default": False, "tooltip": "[anti-OOM] Descarrega o high antes do low, furando o guard de LoRA. Ligue se der OOM na transicao high->low."}),
                 "monitor_memoria": ("BOOLEAN", {"default": False, "tooltip": "Cronometro no console."}),
+                "tile_anchor_fit": (["crop", "stretch"], {"default": "crop", "tooltip": "[tiled] Como ajustar a primeira reference_image ao canvas antes de dividi-la. crop preserva proporcao e corta bordas; stretch mostra tudo, mas pode distorcer."}),
+                "tile_layout": ("BRUXOS_TILE_LAYOUT", {"tooltip": "[tiled] Layout desenhado no Bernini Custom Tile Layout. Substitui tile_w x tile_h."}),
+                "tile_context_mode": (["hybrid", "local", "global"], {"default": "hybrid", "tooltip":
+                    "[tiled] global mantem refs extras inteiras; local recorta por tile; hybrid mistura "
+                    "o recorte detalhado com 20% de uma ancora global reduzida (recomendado)."}),
                 # NOTA: o HD upscale saiu daqui. Refino ladrilhado com o renderer
                 # Bernini + LoRA destilado (LightX2V) so funciona em denoise cheio;
                 # em denoise parcial ele alucina (rede/fantasma). Pra subir resolucao,
@@ -192,6 +213,9 @@ class BruxosBerniniI2V:
                  tile_w=2, tile_h=2, tile_overlap=8, mode="context_window",
                  chunk_size=0, overlap=8, ref_max_size=1280,
                  limpar_vram="leve", force_unload_between_passes=False, monitor_memoria=False,
+                 tile_anchor_fit="crop",
+                 tile_layout=None,
+                 tile_context_mode="hybrid",
                  # compat: workflows antigos podem mandar hd_* -> aceitos e ignorados
                  hd_upscale=False, hd_width=1664, hd_height=960,
                  hd_tiles_w=2, hd_tiles_h=2, hd_denoise=0.35, **_ignored):
@@ -226,11 +250,29 @@ class BruxosBerniniI2V:
         _ref_scale_vid = float(ref_influence_vid_off) if _eff_mode != "multi" else 1.0
         _ref_scale_img = float(ref_influence_img_off) if _eff_mode != "multi" else 1.0
 
-        context_latents = list(_bx_collect_ref(
-            vae, int(aligned), int(ref_max_size),
-            reference_video=reference_video, reference_images=refs,
-            scale_vid=_ref_scale_vid, scale_img=_ref_scale_img,
-        ))
+        tiled_anchor = False
+        if _eff_mode == "tiled" and reference_image is not None:
+            # context[0] e espacial: seu HxW casa com o latent vazio. O guider
+            # tiled recorta este item nas mesmas coordenadas do target. Todo o
+            # resto permanece global para identidade/memoria.
+            anchor_px = _tile_anchor_image(reference_image, W, H, tile_anchor_fit)
+            anchor_latent = _bx_encode_video(vae, anchor_px)
+            if _ref_scale_img != 1.0:
+                anchor_latent = anchor_latent * _ref_scale_img
+            extra_refs = {k: v for k, v in refs.items() if k != "reference_image_0"}
+            context_latents = [anchor_latent]
+            context_latents.extend(_bx_collect_ref(
+                vae, int(aligned), int(ref_max_size),
+                reference_video=reference_video, reference_images=extra_refs,
+                scale_vid=_ref_scale_vid, scale_img=_ref_scale_img,
+            ))
+            tiled_anchor = True
+        else:
+            context_latents = list(_bx_collect_ref(
+                vae, int(aligned), int(ref_max_size),
+                reference_video=reference_video, reference_images=refs,
+                scale_vid=_ref_scale_vid, scale_img=_ref_scale_img,
+            ))
         # avisos (NAO travam nada — so orientam; roda do jeito que voce pediu)
         n_ref_imgs = len(refs)
         if not context_latents:
@@ -260,7 +302,7 @@ class BruxosBerniniI2V:
 
         bern = _BERNINI()
         # Espelha o Bernini Infinity: multi = forca a referencia (w_vid/w_img);
-        # tiled = ladrilho no latente (mas se desliga sozinho com referencia).
+        # tiled = target e ancora espacial recortados juntos a cada passo.
         bern._g_mode = guidance_mode if guidance_mode in ("multi", "tiled") else "off"
         bern._g_wvid = float(reference_strength)
         bern._g_wimg = float(reference_strength)
@@ -271,15 +313,18 @@ class BruxosBerniniI2V:
         bern._g_overlap = int(tile_overlap)
         bern._g_blend = "hann"
         bern._g_tile_cleanup = True
+        bern._g_tile_layout = tile_layout if isinstance(tile_layout, dict) else None
+        bern._g_tile_context_mode = str(tile_context_mode)
         if bern._g_mode == "multi":
             print(f"[Bernini I2V] guidance=multi | reference_strength={float(reference_strength):.2f} "
                   f"(~4x mais lento, forca a referencia).", flush=True)
         elif bern._g_mode == "tiled":
-            if context_latents:
-                print(f"[Bernini I2V] guidance=tiled pedido, MAS ha referencia (context_latents): "
-                      f"o guider de ladrilho se desliga sozinho pra nao virar mosaico. Rodando normal. "
-                      f"O tiled so tila em T2V puro; p/ alta resolucao no i2v use o upscale ladrilhado "
-                      f"(Bernini Infinity Tiled Optimized) DEPOIS.", flush=True)
+            if tiled_anchor:
+                _layout_name = f"custom {len(tile_layout.get('tiles', []))} tiles" if isinstance(tile_layout, dict) else f"{tile_w}x{tile_h}"
+                print(f"[Bernini I2V] guidance=tiled ({_layout_name}, overlap {tile_overlap}) | "
+                      f"context={bern._g_tile_context_mode} | "
+                      f"reference_image -> ancora espacial {W}x{H} ({tile_anchor_fit}); "
+                      f"cada tile recebe uma regiao diferente.", flush=True)
             else:
                 print(f"[Bernini I2V] guidance=tiled ({tile_w}x{tile_h}, overlap {tile_overlap}) — "
                       f"T2V puro sem referencia.", flush=True)

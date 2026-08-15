@@ -17,6 +17,7 @@ Fluxo:  SAM3 (mask) + video -> [Tracked Crop] -> recorte uniforme -> upscale ->
 """
 
 import time
+import math
 import logging
 
 try:
@@ -150,6 +151,13 @@ class BruxosTrackedCrop:
                     "tooltip": "Alinha o tamanho da saida a um multiplo disto (Wan VAE precisa de 16)."}),
                 "mask_grow": ("INT", {"default": 0, "min": -256, "max": 256, "step": 1,
                     "tooltip": "Dilata (+) / contrai (-) a mascara antes de medir o bbox."}),
+                # APPEND-ONLY: funcoes Face Refine, sem deslocar workflows antigos.
+                "center_smooth": ("INT", {"default": 21, "min": 0, "max": 241, "step": 2,
+                    "tooltip": "Suavizacao separada do CENTRO. 21 em 24fps reduz tremor sem atrasar demais o rosto."}),
+                "size_smooth": ("INT", {"default": 51, "min": 0, "max": 301, "step": 2,
+                    "tooltip": "Suavizacao do TAMANHO. Deve ser maior para o crop nao respirar/pulsar."}),
+                "canvas_mode": (["manual", "auto_no_downscale", "auto_capped_768"], {"default": "manual",
+                    "tooltip": "Auto escolhe canvas pelo maior crop. no_downscale nunca descarta detalhe; capped limita o custo a 768."}),
             },
         }
 
@@ -171,7 +179,8 @@ class BruxosTrackedCrop:
 
     def crop(self, images, mask, size_mode="zoom (acompanha o tamanho)",
              out_width=512, out_height=512, padding=0.35, crop_size=0,
-             smooth=7, align=16, mask_grow=0):
+             smooth=7, align=16, mask_grow=0, center_smooth=21,
+             size_smooth=51, canvas_mode="manual"):
         if torch is None:
             raise RuntimeError("[Bruxos Tracked] torch indisponivel.")
         t0 = time.time()
@@ -189,22 +198,27 @@ class BruxosTrackedCrop:
             return int(max(a, round(float(v) / a) * a))
 
         # bbox por frame -> centro + tamanho (carrega o ultimo se sumir)
-        cxs, cys, bws, bhs = [], [], [], []
+        cxs, cys, bws, bhs, detected = [], [], [], [], []
         last = (W / 2.0, H / 2.0, W * 0.3, H * 0.3)
         found = 0
         for t in range(T):
             bb = _frame_bbox(m[t])
             if bb is None:
                 cx, cy, bw, bh = last
+                detected.append(0.0)
             else:
                 x0, y0, x1, y1 = bb
                 bw, bh = x1 - x0, y1 - y0
                 cx, cy = x0 + bw / 2.0, y0 + bh / 2.0
                 last = (cx, cy, bw, bh); found += 1
+                detected.append(1.0)
             cxs.append(cx); cys.append(cy); bws.append(max(4, bw)); bhs.append(max(4, bh))
 
-        cxs = _smooth_series(cxs, smooth); cys = _smooth_series(cys, smooth)
-        bws = _smooth_series(bws, smooth); bhs = _smooth_series(bhs, smooth)
+        cs = int(center_smooth) if int(center_smooth) > 0 else int(smooth)
+        ss = int(size_smooth) if int(size_smooth) > 0 else int(smooth)
+        cxs = _smooth_series(cxs, cs); cys = _smooth_series(cys, cs)
+        bws = _smooth_series(bws, ss); bhs = _smooth_series(bhs, ss)
+        face_heights = list(bhs)
 
         windows = []          # (x0,y0,w,h) por frame na resolucao ORIGINAL
         crops = []; mcrops = []
@@ -213,6 +227,22 @@ class BruxosTrackedCrop:
             out_w, out_h = _al(out_width), _al(out_height)
             ar = out_w / float(out_h)
             pad = float(padding)
+            raw_dims = []
+            for t in range(T):
+                bw = bws[t] * (1.0 + 2 * pad); bh = bhs[t] * (1.0 + 2 * pad)
+                rw = max(bw, bh * ar); rh = rw / ar
+                raw_dims.append((min(rw, W), min(rh, H)))
+            if str(canvas_mode) != "manual":
+                need_w = max(v[0] for v in raw_dims); need_h = max(v[1] for v in raw_dims)
+                cw = max(need_w, need_h * ar); ch = cw / ar
+                if str(canvas_mode) == "auto_capped_768":
+                    scale = min(1.0, 768.0 / max(cw, ch))
+                    cw *= scale; ch *= scale
+                a = max(2, int(align))
+                # Auto nunca arredonda para baixo: isso introduziria um
+                # downscale pequeno mesmo no modo explicitamente no-downscale.
+                out_w = int(math.ceil(cw / a) * a)
+                out_h = int(math.ceil(ch / a) * a)
             for t in range(T):
                 bw = bws[t] * (1.0 + 2 * pad)
                 bh = bhs[t] * (1.0 + 2 * pad)
@@ -254,9 +284,15 @@ class BruxosTrackedCrop:
             "H": int(H), "W": int(W), "T": int(T),
             "mask_crop": cropped_mask.cpu(),
             "zoom": bool(zoom),
+            "face_heights": face_heights,
+            "detected": detected,
+            "center_smooth": cs, "size_smooth": ss,
         }
+        magnification = min(out_h / max(float(v[3]), 1.0) for v in windows)
         info = (f"{'ZOOM' if zoom else 'FIXO'} -> saida {out_w}x{out_h} x{T}f | "
-                f"{found}/{T} frames com mascara | padding={padding} smooth={smooth} | {_fmt_t(time.time() - t0)}")
+                f"{found}/{T} detectados | face {min(face_heights):.0f}-{max(face_heights):.0f}px | "
+                f"magnificacao min={magnification:.2f}x | centro={cs} tamanho={ss} | "
+                f"canvas={canvas_mode} | {_fmt_t(time.time() - t0)}")
         print(f"[Bruxos Tracked Crop] {info}", flush=True)
         return (cropped, cropped_mask, crop_data, info)
 
@@ -275,6 +311,9 @@ class BruxosTrackedStitch:
                     "tooltip": "rectangle = retangulo da janela com feather (recomendado). silhouette = usa a mascara do objeto como alpha (so o sujeito volta)."}),
                 "feather": ("INT", {"default": 24, "min": 0, "max": 512, "step": 1,
                     "tooltip": "Suavidade da borda ao colar (px, na resolucao original). Maior = transicao mais macia."}),
+                "colour_match": ("BOOLEAN", {"default": True,
+                    "tooltip": "Casa media e contraste do crop refinado com a regiao original antes da colagem."}),
+                "blend": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
             },
         }
 
@@ -288,7 +327,8 @@ class BruxosTrackedStitch:
         "ocupava em cada frame (desfaz o zoom), com feather. Corrige contagem de frames."
     )
 
-    def stitch(self, crop_data, edited_crop, compose="rectangle", feather=24):
+    def stitch(self, crop_data, edited_crop, compose="rectangle", feather=24,
+               colour_match=True, blend=1.0):
         if torch is None:
             raise RuntimeError("[Bruxos Tracked] torch indisponivel.")
         t0 = time.time()
@@ -318,9 +358,18 @@ class BruxosTrackedStitch:
             else:
                 a = _bx_rect_feather(1, h, w, max(1, int(feather)))[0].unsqueeze(-1)
             region = final[t, y0:y0 + h, x0:x0 + w, :]
+            if bool(colour_match):
+                # Match suave por canal; clamp do ganho evita amplificar ruido.
+                dims = (0, 1)
+                pm, ps = piece.mean(dims, keepdim=True), piece.std(dims, keepdim=True).clamp_min(1e-4)
+                rm, rs = region.mean(dims, keepdim=True), region.std(dims, keepdim=True).clamp_min(1e-4)
+                gain = (rs / ps).clamp(0.5, 2.0)
+                piece = ((piece - pm) * gain + rm).clamp(0, 1)
+            a = a * float(blend)
             final[t, y0:y0 + h, x0:x0 + w, :] = region * (1.0 - a) + piece * a
 
-        info = (f"stitch {T}f em {W}x{H} | compose={compose} feather={int(feather)}px | {_fmt_t(time.time() - t0)}")
+        info = (f"stitch {T}f em {W}x{H} | compose={compose} feather={int(feather)}px | "
+                f"colour_match={bool(colour_match)} blend={float(blend):.2f} | {_fmt_t(time.time() - t0)}")
         print(f"[Bruxos Tracked Stitch] {info}", flush=True)
         return (final.clamp(0, 1), info)
 

@@ -13,6 +13,7 @@ Backends de decode/encode em camadas: PyAV (vem com o ComfyUI) -> imageio-ffmpeg
 
 import os
 import json
+import hashlib
 import logging
 import datetime
 from fractions import Fraction
@@ -285,11 +286,39 @@ def _make_video_obj(images, audio, fps):
 # ===========================================================================
 # NODE: Load Video
 # ===========================================================================
+_BX_GIRO = ["off", "90 (horario)", "-90 (anti-horario)", "180"]
+
+
+def bx_rotacionar(t, giro):
+    """Gira um lote [B,H,W,C] ou uma mascara [B,H,W]. Devolve o mesmo tipo.
+
+    torch.rot90 com k=1 gira ANTI-HORARIO no plano (dims na ordem dada), entao
+    o horario e k=-1. Escrevi os rotulos com a direcao por extenso porque "90"
+    sozinho e ambiguo -- editor de video, camera e biblioteca de imagem nao
+    concordam sobre o sinal, e trocar isso depois quebraria grafos salvos.
+
+    -180 nao existe como opcao: e o mesmo que 180.
+    """
+    g = str(giro or "off")
+    if g.startswith("off"):
+        return t
+    dims = (1, 2)                      # (H, W) tanto em [B,H,W,C] quanto em [B,H,W]
+    if g.startswith("90"):
+        k = -1
+    elif g.startswith("-90"):
+        k = 1
+    elif g.startswith("180"):
+        k = 2
+    else:
+        return t
+    return torch.rot90(t, k, dims).contiguous()
+
+
 class BruxosLoadVideo:
     @classmethod
     def INPUT_TYPES(cls):
         files = _list_input_videos()
-        return {
+        inputs = {
             "required": {
                 "video": (files if files else ["(coloque videos em ComfyUI/input)"],
                           {"tooltip": "Seletor de videos da pasta ComfyUI/input. Use o botao de upload pra enviar um novo."}),
@@ -327,23 +356,56 @@ class BruxosLoadVideo:
                     "tooltip": "Largura do box (0..1)."}),
                 "crop_h": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.001,
                     "tooltip": "Altura do box (0..1)."}),
+                # ---------------------------------------------------------
+                # APPEND-ONLY: widget NOVO vai no FIM. O ComfyUI casa os
+                # widgets_values salvos por ORDEM, nao por nome -- inserir no
+                # meio desloca TODOS os valores dos grafos ja salvos.
+                # ---------------------------------------------------------
+                "girar": (_BX_GIRO, {"default": "off", "tooltip":
+                    "Gira os frames ANTES do fit/crop -- e por isso que ele fica aqui e nao "
+                    "depois: girar troca largura por altura, e o box de corte precisa ser "
+                    "calculado ja na orientacao final.\n\n"
+                    "Serve para o caso do celular: o arquivo guarda quadros 16:9 mais uma "
+                    "FLAG de rotacao, e decoder que ignora a flag entrega deitado.\n\n"
+                    "'-180' nao existe: e o mesmo que 180.\n"
+                    "As saidas 'width' e 'height' ja saem trocadas quando voce usa 90 ou -90."}),
+                "criar_cache_ssd": ("BOOLEAN", {"default": True, "tooltip":
+                    "Cria a saida Cache automaticamente no temp. Desligue no modo RAM puro do H3 Loop."}),
             },
         }
+        # Usa o agrupamento advanced nativo dos dois renderers. Um botao
+        # customizado entraria em widgets_values e quebraria a restauracao por
+        # indice de workflows antigos.
+        for spec in inputs["optional"].values():
+            if len(spec) > 1 and isinstance(spec[1], dict):
+                spec[1]["advanced"] = True
+        return inputs
 
-    RETURN_TYPES = ("IMAGE", "VIDEO", "AUDIO", "FLOAT", "INT", "INT", "INT", "STRING")
-    RETURN_NAMES = ("images", "video", "audio", "fps", "frame_count", "width", "height", "video_info")
+    # APPEND-ONLY: Cache fica no fim para workflows antigos manterem os indices
+    # de todas as saidas que ja existiam.
+    RETURN_TYPES = ("IMAGE", "VIDEO", "AUDIO", "FLOAT", "INT", "INT", "INT", "STRING",
+                    "BRUXOS_FRAME_CACHE")
+    RETURN_NAMES = ("images", "video", "audio", "fps", "frame_count", "width", "height", "video_info",
+                    "Cache")
     FUNCTION = "load"
     CATEGORY = "Bruxos do VFX/Video"
 
     def load(self, video, video_path="", force_rate=0.0, custom_width=0, custom_height=0,
              frame_load_cap=0, skip_first_frames=0, select_every_nth=1, reverse=False,
              fit_mode="off (original)", target_width=0, target_height=0,
-             aspect="livre", crop_x=0.0, crop_y=0.0, crop_w=1.0, crop_h=1.0):
+             aspect="livre", crop_x=0.0, crop_y=0.0, crop_w=1.0, crop_h=1.0,
+             girar="off", criar_cache_ssd=True):
         path = _resolve_path(video, video_path)
         images, src_fps, out_fps = decode_video(
             path, skip_first_frames, frame_load_cap, select_every_nth,
             force_rate, custom_width, custom_height,
         )
+        # ---- GIRO: antes do fit/crop, senao o box e calculado deitado ----
+        if str(girar).split()[0] != "off":
+            antes = tuple(images.shape[1:3])
+            images = bx_rotacionar(images, girar)
+            print(f"[Bruxos Load Video] girar {girar}: "
+                  f"{antes[1]}x{antes[0]} -> {images.shape[2]}x{images.shape[1]}", flush=True)
         # ---- FIT / CROP (box) aplicado no lote de frames ----
         if _bx_apply_fit is not None and str(fit_mode).split()[0] != "off":
             try:
@@ -373,9 +435,53 @@ class BruxosLoadVideo:
             "has_audio": audio is not None,
         }
         info_json = json.dumps(info, ensure_ascii=False)
+
+        # Saida direta para o Bernini SSD81. O cache e lossless-u8, dividido em
+        # blocos fisicos de 81 frames e salvo automaticamente em ComfyUI/temp.
+        # O nome inclui arquivo + opcoes que alteram os frames; mudar qualquer
+        # uma delas cria outro cache, enquanto a mesma configuracao e reusada.
+        cache_path = ""
+        try:
+            if not bool(criar_cache_ssd):
+                info["cache_ssd"] = "desativado (modo RAM puro)"
+                raise StopIteration
+            stat = os.stat(path)
+            cache_key = {
+                "path": os.path.abspath(path), "mtime_ns": int(stat.st_mtime_ns),
+                "size": int(stat.st_size), "force_rate": float(force_rate),
+                "custom_width": int(custom_width), "custom_height": int(custom_height),
+                "frame_load_cap": int(frame_load_cap), "skip_first_frames": int(skip_first_frames),
+                "select_every_nth": int(select_every_nth), "reverse": bool(reverse),
+                "fit_mode": str(fit_mode), "target_width": int(target_width),
+                "target_height": int(target_height), "aspect": str(aspect),
+                "crop": [float(crop_x), float(crop_y), float(crop_w), float(crop_h)],
+                "girar": str(girar),
+            }
+            digest = hashlib.sha1(
+                json.dumps(cache_key, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()[:12]
+            stem = os.path.splitext(os.path.basename(path))[0]
+            cache_name = f"load_video_{stem}_{digest}"
+            # Import tardio evita o ciclo: bruxos_disk_stream tambem usa os
+            # decoders deste modulo.
+            from .bruxos_disk_stream import BruxosImagensParaDisco
+            cache_path, _, _, cache_info = BruxosImagensParaDisco().run(
+                images, cache_name, 81,
+                float(out_fps if out_fps > 0 else (src_fps or 24.0)), False,
+            )
+            info["cache_ssd_81"] = cache_path
+            info["cache_info"] = cache_info
+            info_json = json.dumps(info, ensure_ascii=False)
+        except StopIteration:
+            info_json = json.dumps(info, ensure_ascii=False)
+        except Exception as exc:
+            raise RuntimeError(
+                f"[Bruxos Load Video] nao foi possivel criar o Cache SSD81 automatico: {exc}"
+            ) from exc
+
         result = (images, video_obj, audio,
                   float(out_fps if out_fps > 0 else src_fps),
-                  int(B), int(W), int(H), info_json)
+                  int(B), int(W), int(H), info_json, cache_path)
 
         # UI: infos pro node + ponteiro de preview (so quando vem do diretorio input)
         ui = {"bruxos_info": [info_json]}
@@ -688,7 +794,10 @@ BruxosLoadVideo.DESCRIPTION = (
     "- frame_load_cap: maximo de frames a carregar (0 = todos).\n"
     "- skip_first_frames: pula os N primeiros frames.\n"
     "- select_every_nth: pega 1 a cada N frames.\n"
-    "SAIDAS: images, video (VIDEO nativo), audio, fps, frame_count, video_info (JSON)."
+    "SAIDAS: images, video (VIDEO nativo), audio, fps, frame_count, video_info (JSON) "
+    "e Cache (BRUXOS_FRAME_CACHE), pronto para ligar direto no source_cache do "
+    "Bernini Infinity SSD 81. A pasta e criada automaticamente em ComfyUI/temp e "
+    "reaproveitada quando o arquivo e as opcoes de carga nao mudaram."
 )
 
 BruxosSaveVideo.DESCRIPTION = (

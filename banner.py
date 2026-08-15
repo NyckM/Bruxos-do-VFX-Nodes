@@ -99,7 +99,7 @@ def render(node_count=None, version=""):
     out.append("")
     out.append("  " + g + "B R U X O S" + reset + p + "  D O   V F X" + reset
                + dim + ver + nc + reset)
-    out.append("  " + dim + "remocao de objetos - upscale - face swap - Bernini/Wan" + reset)
+    out.append("  " + dim + "Bernini/Wan/LTX/Mocha/Sam/Minimax" + reset)
     out.append("")
     return "\n".join(out)
 

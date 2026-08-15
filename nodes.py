@@ -997,6 +997,20 @@ class BerniniInfinity:
                     "[modos *_apg] Renormaliza o resultado pra ter a mesma magnitude da predicao condicional. A projecao APG "
                     "ENCOLHE o resultado; sem esse rescale a imagem tende a sair lavada/sem contraste em guidance alto. "
                     "O BerniniRWrapper deixa LIGADO por padrao. Aqui vem desligado (neutro); ligue junto com apg_eta baixo."}),
+                "tile_layout": ("BRUXOS_TILE_LAYOUT", {"tooltip":
+                    "[guidance_mode=tiled] Layout vindo do Bernini Custom Tile Layout. Quando conectado, "
+                    "substitui a grade tile_w x tile_h por retangulos livres desenhados no canvas."}),
+                "tile_context_mode": (["hybrid", "local", "global"], {"default": "hybrid", "tooltip":
+                    "[tiled] global: referencias/tail inteiros em cada tile (mais lento). local: recorta "
+                    "as referencias proporcionalmente. hybrid: recorte detalhado + 20% de ancora global "
+                    "reduzida, sem criar outro stream nem mudar image0/image1."}),
+                "persistent_first_frame": ("BOOLEAN", {"default": False, "tooltip":
+                    "Codifica o primeiro frame do source como memoria visual separada e o reapresenta "
+                    "em todas as janelas/chunks. Ajuda a impedir deriva de lugar, horizonte e arquitetura."}),
+                "first_frame_strength": ("FLOAT", {"default": 0.45, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Forca da memoria inicial. 0.35-0.55 ancora a geometria sem obrigar o video a voltar."}),
+                "first_frame_decay": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Modo sequential: multiplica a memoria a cada chunk. No context_window ela fica global."}),
             },
         }
 
@@ -1067,6 +1081,11 @@ class BerniniInfinity:
         apg_norm_threshold=0.0,
         omega_scale=1.0,
         apg_rescale=False,
+        tile_layout=None,
+        tile_context_mode="hybrid",
+        persistent_first_frame=False,
+        first_frame_strength=0.45,
+        first_frame_decay=0.75,
         **kwargs,
     ):
         # guidance: 'off' = CFG unico (padrao). 'tiled' = ladrilho. Os demais sao
@@ -1121,6 +1140,8 @@ class BerniniInfinity:
         self._g_overlap = int(tile_overlap)
         self._g_blend = "hann"
         self._g_tile_cleanup = True
+        self._g_tile_layout = tile_layout if isinstance(tile_layout, dict) else None
+        self._g_tile_context_mode = str(tile_context_mode)
         if monitor_memoria:
             _mem_report("inicio")
         if self._g_mode == "stream":
@@ -1133,6 +1154,7 @@ class BerniniInfinity:
                   + ". Fallback p/ CFG se o formato do cond nao bater.", flush=True)
         elif self._g_mode == "tiled":
             print(f"[Bernini Infinity] guidance_mode=tiled ({tile_w}x{tile_h}, overlap {tile_overlap}) "
+                  f"context={self._g_tile_context_mode} "
                   f"-> ladrilho fundido a cada passo (maiores resolucoes / menos VRAM). "
                   f"Fallback p/ CFG se o wan_tiled/cond nao baterem.", flush=True)
         frame_count = int(source_video.shape[0])
@@ -1190,6 +1212,8 @@ class BerniniInfinity:
                 resize_mode=resize_mode,
                 limpar_vram=limpar_vram, monitor_memoria=monitor_memoria,
                 force_unload_between_passes=force_unload_between_passes,
+                persistent_first_frame=persistent_first_frame,
+                first_frame_strength=first_frame_strength,
             )
         return self._render_sequential(
             positive, negative, high_model, low_model, vae, source_video,
@@ -1202,6 +1226,9 @@ class BerniniInfinity:
             resize_mode=resize_mode,
             limpar_vram=limpar_vram, monitor_memoria=monitor_memoria,
             force_unload_between_passes=force_unload_between_passes,
+            persistent_first_frame=persistent_first_frame,
+            first_frame_strength=first_frame_strength,
+            first_frame_decay=first_frame_decay,
         )
 
     # ------------------------------------------------------------------
@@ -1301,6 +1328,8 @@ class BerniniInfinity:
                 getattr(self, "_g_rows", 2), getattr(self, "_g_cols", 2),
                 getattr(self, "_g_overlap", 8), getattr(self, "_g_blend", "hann"),
                 getattr(self, "_g_tile_cleanup", True),
+                getattr(self, "_g_tile_layout", None),
+                getattr(self, "_g_tile_context_mode", "hybrid"),
             )
             if out is not None:
                 return out
@@ -1328,6 +1357,8 @@ class BerniniInfinity:
         resize_mode="stretch",
         limpar_vram="leve", monitor_memoria=False,
         force_unload_between_passes=False,
+        persistent_first_frame=False, first_frame_strength=0.45,
+        first_frame_decay=0.75,
     ):
         step = max(1, chunk_size - overlap)
         lat_drop = ((overlap - 1) // 4) + 1 if overlap > 0 else 0
@@ -1354,6 +1385,16 @@ class BerniniInfinity:
         previous_generated_frames = None
         chunk_index = 0
 
+        persistent_latent = None
+        if bool(persistent_first_frame) and float(first_frame_strength) > 0.0:
+            memory_frame = _resize_long_edge(source_video[:1], int(ref_max_size))
+            persistent_latent = _encode_video(vae, memory_frame[:, :, :, :3]).detach()
+            print(
+                f"[Bernini Infinity][seq] memoria frame 0 ativa: "
+                f"strength={float(first_frame_strength):.3f}, decay={float(first_frame_decay):.3f}",
+                flush=True,
+            )
+
         for start in range(0, target, step):
             end = min(start + chunk_size, target)
             raw_chunk = source_video[start:end]
@@ -1375,6 +1416,14 @@ class BerniniInfinity:
                     scale_vid=self._g_ref_scale_vid, scale_img=self._g_ref_scale_img,
                 )
             )
+
+            if persistent_latent is not None:
+                memory_scale = float(first_frame_strength) * (float(first_frame_decay) ** chunk_index)
+                context_latents.append(persistent_latent * memory_scale)
+                print(
+                    f"[Bernini Infinity][seq] memoria frame 0 no chunk {chunk_index + 1}: "
+                    f"{memory_scale:.3f}", flush=True,
+                )
 
             if tail_memory and previous_generated_frames is not None:
                 tail_count = min(int(tail_frames), int(previous_generated_frames.shape[0]))
@@ -1477,6 +1526,7 @@ class BerniniInfinity:
         resize_mode="stretch",
         limpar_vram="leve", monitor_memoria=False,
         force_unload_between_passes=False,
+        persistent_first_frame=False, first_frame_strength=0.45,
     ):
         target = int(target)
         # --- alinhamento temporal: trabalhamos no proximo 4n+1 e cortamos depois ---
@@ -1534,6 +1584,14 @@ class BerniniInfinity:
                 scale_vid=self._g_ref_scale_vid, scale_img=self._g_ref_scale_img,
             )
         )
+        if bool(persistent_first_frame) and float(first_frame_strength) > 0.0:
+            memory_frame = _resize_long_edge(source_video[:1], int(ref_max_size))
+            memory_latent = _encode_video(vae, memory_frame[:, :, :, :3])
+            context_latents.append(memory_latent * float(first_frame_strength))
+            print(
+                f"[Bernini Infinity][ctx] memoria visual persistente do frame 0: "
+                f"strength={float(first_frame_strength):.3f}", flush=True,
+            )
         values = {"context_latents": context_latents}
         pos = _clone_conditioning_set_values(positive, values)
         neg = _clone_conditioning_set_values(negative, values)
@@ -3120,7 +3178,7 @@ except Exception:
 
 
 def _bx_tiled_sample(model, add_noise, seed, cfg, positive, negative, sampler, sigmas, latent,
-                     rows, cols, overlap, blend, cleanup):
+                     rows, cols, overlap, blend, cleanup, layout=None, context_mode="hybrid"):
     """Um passo de sampling COM LADRILHO (step-fused): o Wan Tiled Guider prediz
     cada ladrilho e funde a cada passo de denoise. Reusa o SamplerCustomAdvanced
     canonico (mesmo dominio do SamplerCustom). Retorna o dict de latent, ou None
@@ -3141,7 +3199,8 @@ def _bx_tiled_sample(model, add_noise, seed, cfg, positive, negative, sampler, s
         guider = _BX_TILED_GUIDER(model)
         guider.set_conds(positive, negative)
         guider.set_cfg(float(cfg))
-        guider.set_tiling(int(rows), int(cols), int(overlap), str(blend), bool(cleanup), False)
+        guider.set_tiling(int(rows), int(cols), int(overlap), str(blend), bool(cleanup), False,
+                          layout, context_mode)
         noise = _NR(int(seed)) if add_noise else _NE()
         out = _SCA.execute(noise, guider, sampler, sigmas, latent)
         return out.args[0] if hasattr(out, "args") else out[0]
