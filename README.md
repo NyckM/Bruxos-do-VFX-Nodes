@@ -1,244 +1,119 @@
 # ComfyUI Bruxos do VFX
 
-Custom nodes para VFX de vídeo com Wan 2.2 / Bernini: remoção de objetos e pessoas, upscale por batch, face swap, MoCha, tiling em resolução maior, comparação A/B e utilitários — tudo em português, feitos pra produção real.
+Nodes de produção para ComfyUI: MiniMax H3, Bernini/Wan, inpaint, tracking, vídeo, tiles, upscale e composição. A interface e os relatórios são em português.
 
-<img width="832" height="480" alt="Workflow para remover objetos e pessoas" src="https://github.com/user-attachments/assets/6745a8ce-00ce-4915-a60d-ed1354099311" />
+## Instalação no Windows
 
-## Por que existe
-
-Desenvolvido na **Bruxos do VFX** para dois longas-metragens — *Dr. Monstro* (Marcos Jorge) e *Alice Júnior 2* (Gil Baroni) — onde a demanda de composição e integração de cenas gerou a necessidade de uma ferramenta própria de remoção de objetos sobre Bernini/Wan.
-
-**Resultados:**
-
-Remoção de objetos — média de 96 frames em 204 segundos (832×480):
-
-https://github.com/user-attachments/assets/1575f97f-34b9-492a-accb-818e97a6cbde
-
-https://github.com/user-attachments/assets/d1e47486-ac3b-4030-be42-56a0f16b0128
-
-Remoção em **1920×1080 Full HD** — 39 frames em 325 segundos:
-
-https://github.com/user-attachments/assets/55426421-bdbd-4c04-a727-6dfc95839e19
-
-https://github.com/user-attachments/assets/2c0222a3-7b5f-4c4f-b430-c3fb6a178218
-
----
-
-## Instalação
-
-### Fácil (recomendado)
-
-Rode o instalador de dentro da pasta do node — ele instala as dependências **e baixa os modelos** nas pastas certas:
+Coloque esta pasta em `ComfyUI\custom_nodes\ComfyUI-Bruxos-do-VFX`, feche o ComfyUI e execute:
 
 ```text
-ComfyUI\custom_nodes\ComfyUI-Bruxos-do-VFX\install.bat     (Windows)
-bash ComfyUI/custom_nodes/ComfyUI-Bruxos-do-VFX/install.sh (Linux / RunPod)
+install.bat
 ```
 
-É **idempotente**: modelos já baixados são pulados, então pode rodar de novo pra retomar um download interrompido.
-
-> **O instalador nunca mexe em `torch`, `numpy`, `triton`, `xformers` ou `flash-attn`.** Ele detecta a CUDA do seu torch e instala o `onnxruntime-gpu` que **casa** com ela (cu12x → build CUDA 12; cu13x → build CUDA 13).
-
-### Manual
-
-Copie a pasta para `ComfyUI/custom_nodes/ComfyUI-Bruxos-do-VFX` e reinicie.
-
-### Requisitos de terceiros (só para alguns nodes)
-
-A maioria dos nodes roda **só com o ComfyUI core** (Bernini, Bernini Tiled/Optimized, Wan Tiled, Tiles, vídeo, utilitários). Alguns dependem de outro pacote de custom node **para o modelo rodar** — o pacote Bruxos carrega normalmente sem eles, mas os nodes abaixo só funcionam se o respectivo pacote estiver instalado:
-
-| Nodes | Precisam de | Por quê |
-|---|---|---|
-| **Mocha Embeds/Info/BBox**, **WanVideo Context** | [ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper) (Kijai) | o modelo MoCha, o `WanVideo Sampler`, os tipos `WANVAE`/`WANVIDIMAGE_EMBEDS` são do wrapper |
-| **LTX Tiled Sampler** | [ComfyUI-LTXVideo](https://github.com/Lightricks/ComfyUI-LTXVideo) (Lightricks) | precisa do modelo/pipeline LTX |
-| **FaceFusion Swap/Detectar** | `onnxruntime-gpu` + `opencv` (via instalador) | engine ONNX de face swap |
-
-### Modelos
-
-O `install.bat` / `install.sh` baixa tudo automaticamente. Se preferir na mão:
-
-| Modelo | Onde baixar | Pasta destino |
-|---|---|---|
-| **Bernini-R INT8 ConvRot** (high + low) | [Comfy-Org/Bernini-R](https://huggingface.co/Comfy-Org/Bernini-R/tree/main/diffusion_models) | `models/diffusion_models` |
-| **LoRA LightX2V 4-step** (high + low) | [rzgar/Bernini-R-LightX2V-4step-loras](https://huggingface.co/rzgar/Bernini-R-LightX2V-4step-loras) | `models/loras` |
-| Text encoder (umt5-xxl fp8) | [Comfy-Org/Wan_2.1_ComfyUI_repackaged](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged) | `models/text_encoders` |
-| **VAE de vídeo** (Wan 2.1 bf16) | [Kijai/WanVideo_comfy](https://huggingface.co/Kijai/WanVideo_comfy/blob/main/Wan2_1_VAE_bf16.safetensors) | `models/vae` |
-
-> ⚠️ **Use o VAE de VÍDEO** (`Wan2_1_VAE_bf16`). Um VAE `imageonly` / `upscale2x` devolve o tensor em outro layout e o vídeo sai **preto/quebrado**.
-
-> Baixe por CLI/gerenciador, não pelo navegador — download incompleto gera arquivo corrompido.
-
-**Por que INT8 ConvRot:** os pesos e ativações rodam em 8 bits nos tensor cores (`torch._int_mm`), não é desquantização on-the-fly como o GGUF. O ConvRot rotaciona os pesos antes de quantizar pra eliminar outliers. Precisa de ComfyUI recente + Triton.
-
-**Configuração com as LoRAs LightX2V:** `cfg = 1.0` e `steps = 6` com `split_step = 4`.
-
----
-
-## Nodes
-
-<img width="226" height="557" alt="Bernini Long Condition" src="https://github.com/user-attachments/assets/934fd9b3-087f-47db-aeb2-6ca01967c556" />
-
-### Bernini / Geração
-- **Bernini Infinity** — o renderer principal para vídeos maiores que o limite de 81 frames, sem precisar de um sampler novo. Injeta `context_latents` por chunk (com `tail_memory` opcional). Inclui correção automática de frames **4n+1**, gerenciamento de VRAM, máscara de região e `guidance_mode` (off / multi).
-- **Bernini Region Mask** — normaliza máscara colorida (SAM2/SAM3/Scail2Color) em B/W, com invert/grow/blur.
-- **Bernini Prompt Enhancer** — reescreve sua instrução via Qwen-VL **local**, com visão de keyframes. Self-text reasoning do paper do Bernini.
-- **First-Frame CoT: Extrair / Compor** — edite o primeiro frame como imagem e propague pro vídeo (self-vision-text do paper).
-- **Bernini Long** *(Conditioning / ChunkSelect / VideoMerge / AppendVideoChunk / EmptyVideoChunks / Info)* — helpers de vídeo longo.
-- **FaceStitchUpscale** — cola o rosto upscalado de volta no vídeo usando os `face_bboxes`.
-- **Editor de Pontos SAM3** — clique **verde = selecionar**, **roxo = negar** sobre o frame.
-- **Bernini I2V / Ref-to-Video (Bruxos)** *(novo)* — gera um vídeo a partir de **uma imagem de referência, SEM `source_video`** (o Bernini Infinity é V2V e exige fonte; este não). A imagem entra como *referência*, o node cria um **latente vazio de `length` frames** e amostra do ruído (high→low) guiado pela referência + prompt. É o mesmo caminho do node oficial `BerniniConditioning` no modo i2v, mas **tudo num node só** (conditioning + KSampler com split high/low + decode). Aceita uma segunda referência (ex.: close do rosto) e tem `force_unload_between_passes` anti-OOM. Lembre: é *reference-to-video* (o modelo inventa o movimento), não animação de still com movimento pré-existente.
-
-### Bernini Infinity Tiled *(novo)*
-- **Bernini Infinity Tiled (Bruxos)** — roda o Bernini COMPLETO **por ladrilho em pixels** para alcançar resoluções maiores em **qualquer função** (remover, modificar, gerar, refinar). Cada ladrilho recebe o próprio pedaço do vídeo-fonte — a posição nunca se perde. A **costura viva** cola o resultado já gerado dos vizinhos na faixa de sobreposição (máscara zerada ali) → os ladrilhos casam em cor e conteúdo.
-
-  Três modos de máscara por ladrilho:
-  - `off` — modifica o shot todo (guiado pelo prompt).
-  - `inpaint` — só a área da máscara muda; tiles sem máscara são pulados (`pular_tiles_vazios`).
-  - `bbox` — **duplo recorte**: dentro do tile, recorta ainda na bounding box da máscara e roda só essa área. É o modo mais rápido quando o objeto a remover é pequeno relativo ao tile.
-
-  **Ganho real do `bbox` medido** (objeto = 10% do tile, shot 1664×960, grade 2×2):
-
-  | Modo | Área processada | Velocidade relativa |
-  |---|---|---|
-  | `off` | 2.334.720 px (4 tiles) | 38× mais lento |
-  | `inpaint` | 583.680 px (1 tile) | 9,6× mais lento |
-  | **`bbox`** | **60.928 px (1 bbox)** | **referência** |
-
-  Custo honesto: N ladrilhos = N renders do Bernini, cada um menor. Não é "mais rápido" no caso geral: é "cabe na VRAM e sem mosaico". Arquitetura inspirada no [TiledWan](https://github.com/Baverne/comfyUI-TiledWan) (Baverne), reimplementada do zero.
-
-- **Bernini Infinity Tiled Optimized (Bruxos)** *(novo)* — mesma ideia do Tiled, mas com um pipeline de latente reaproveitado para cortar encode/decode e troca de modelo repetidos:
-  - **`latent_encode_once`** — codifica o vídeo-fonte **uma vez** no VAE e recorta o latente por tile (elimina os N encodes). Vale no modo `off` e no `bbox`.
-  - **`decode_once`** — monta os latentes de todos os tiles e **decodifica o vídeo final uma vez só** (no `off` compõe o canvas inteiro; no `bbox` compõe só as regiões da máscara em latente). Menos decodes, ao custo de um pico de VRAM no decode final.
-  - **`agrupar_high_low`** — roda o passo **HIGH de todos os tiles primeiro** (modelo HIGH residente na VRAM a grade inteira) e depois o **LOW de todos** → troca de modelo **1× em vez de 1× por tile** (some com o re-stage/re-patch repetido no log). Clona o ModelPatcher **uma vez por fase**, não por tile.
-  - Loga o backend de atenção ativo (Sage/Flash) 1× por sessão e como ativá-lo (é flag de *launch* do ComfyUI, não dá pra ligar por node).
-
-  > Todos são **opcionais e experimentais** (padrão desligado onde custam VRAM). Ligue conforme sobrar memória.
-
-### Tiles (utilitários de corte/costura)
-- **Tile Split / Select / Accumulate / Merge (Bruxos)** — corta a imagem/vídeo em ladrilhos pela **contagem** (2×2, 8×8…), com tamanho calculado automaticamente e alinhado ao múltiplo de 16. Para uso com For Loop + seu próprio sampler. `1×1` = passthrough. Merge detecta upscale automaticamente.
-- **Wan Tiled Sampler (Bruxos)** — guider step-fused (estilo Deno/LTX): corta o latente em tiles e funde a cada passo de denoise com janela Hann complementar (soma = 1, sem emenda). Saída `GUIDER` → `SamplerCustomAdvanced`. ⚠️ Com `context_latents` (V2V Bernini) desliga automaticamente com aviso — use o **Bernini Infinity Tiled** nesse caso.
-- **LTX Tiled Sampler (Bruxos)** *(novo)* — o mesmo step-fused, mas para o modelo **LTX** (latente 5D). Funde a predição de ruído a cada passo (os tiles se enxergam, sem emenda por construção), com **timer de progresso** por passo e limpeza de VRAM por ladrilho. Diferente da `LTXVTiledSampler` oficial da Lightricks (que roda cada tile até o fim antes de fundir → pode divergir). Não reproduz o guia de imagem por ladrilho (`LTXVAddGuide`) da versão oficial — para fluxos com guia de imagem pesado, prefira a oficial. Saída `GUIDER` → `SamplerCustomAdvanced`. *(precisa do modelo LTX; ComfyUI-LTXVideo)*
-
-### MoCha
-- **Mocha Embeds (Bruxos)** — substitui o `MochaEmbeds` do WanVideoWrapper. Corrige o bug de frames do original (111 → 109, perdendo 2; aqui o padding é **espelhado** e você corta de volta sem perder nada). Aceita **MASK ou IMAGE colorida** (SAM3/SCAIL/FaceFusion). O MoCha usa **uma única máscara** pro vídeo inteiro: se você ligar uma por frame, o node reduz por **união** ou **primeiro frame**. Inclui `tiled_vae`, limpeza de memória e cronômetro.
-- **Mocha Info (Bruxos)** — calcula antes de rodar (sem gastar VRAM) os frames alinhados, o `seq_len` e o plano de blocos.
-- **Mocha BBox Crop / Mocha BBox Stitch (Bruxos)** *(novo)* — par **crop & stitch** (estilo Inpaint Crop&Stitch) para rodar o MoCha **só na região do sujeito** em resolução cheia. O Crop recorta a bounding box da máscara (com contexto, alinhado ao múltiplo de 16) e, opcional, uma **faixa de frames** (`frame_start`/`frame_count`) para vídeo longo; as **refs de identidade passam inteiras**. Encaixe: `Mocha BBox Crop → Mocha Embeds → WanVideo Sampler → Decode → Mocha BBox Stitch`. Mais rápido e sem seam quando o sujeito é pequeno/médio no frame. *Por que não uma grade N×M:* o MoCha rastreia o personagem por atenção global a partir de **uma única máscara** — fatiar em grade quebraria o rastreamento; o bbox mantém máscara + sujeito juntos, respeitando a arquitetura do modelo.
-- **WanVideo Context (Bruxos)** *(novo)* — gera o objeto `context_options` (janelas temporais) para o **WanVideo Sampler**, o remédio de **OOM** do MoCha e de gerações Wan longas. Processar em janelas de N frames derruba o custo da atenção (que é O(seq_len²) e linear nos frames) — ex.: 49f ≈ 39% do custo de 81f; 33f ≈ 20%. No MoCha o sampler reanexa **máscara + refs em cada janela**, então o rastreamento fica intacto bloco a bloco. Node 100% Python puro (não importa nada de terceiros); ligue em `context_options` do Sampler. *(o Sampler é o do WanVideoWrapper, já necessário para rodar MoCha)*
-
-### Face / Troca de rosto *(precisa das libs ONNX)*
-- **FaceFusion Swap (Bruxos)** — troca de rosto **100% local** (ONNX, sem API). Aceita imagem única ou vídeo inteiro, 13 swappers (`hyperswap_1c_256` recomendado), `pixel_boost` até 1024, seleção `one`/`many`/`reference` e máscaras combináveis. Sai com uma **MASK dos rostos** que liga direto no `region_mask` do Bernini Infinity.
-- **FaceFusion Detectar Rostos (Bruxos)** — preview com caixas e landmarks, MASK por frame e contagem.
-
-### Vídeo
-- **Load Video** / **Save Video** — equivalentes ao VHS com tipo `VIDEO` nativo, preview já cortado por skip/cap/nth/force_rate, mais controle de codec/CRF. O **Load Video** tem widget **`reverse`** (inverte a ordem dos frames, aplica depois de skip/cap/nth). O **Save Video** diagnostica tensores malformados e denuncia NaN/vídeo preto em vez de gravar em silêncio.
-- **Comparar Vídeos A/B** — player embutido (cortina, lado a lado, diferença, alternar).
-- **Prever BBox da Máscara** — desenha a caixa que o modo `bbox` recortaria, antes de rodar.
-
-### Upscale
-- **Config de Upscale** / **Blend de Batches** — super-nodes que substituem os subgraphs de Settings/Blend Frames.
-- **Pad to 4n+1** / **Trim 4n+1 back to N** — envolvem qualquer etapa Wan pra não perder frames.
-
-### Utilidades
-Crescer+Borrar Máscara, Máscara em Blocos, Desenhar Máscara na Imagem, Face Crop Expand, Nitidez Inteligente, Texto/Mostrar Texto, Seed, Carregar Imagens da Pasta, Info do Vídeo, **Loader Tudo-em-1 Wan**, **Qwen-VL Caption**, **Prompt Guide** (35 presets Bernini, incluindo as 22 tarefas do Bernini-Bench), **Cronômetro / Relatório de Tempo**, Tracking (Camera/Point/Object + Export + Visualizer).
-
----
-
-## Troca de rosto (FaceFusion) — incluída no pacote
-
-Os nodes de face swap já vêm **dentro** deste pacote (pasta `facefusion/`), mas dependem de `onnxruntime-gpu`/`opencv`. Se essas libs não estiverem instaladas, **só os dois nodes de rosto** deixam de aparecer — todo o resto do pacote carrega normalmente.
-
-O `install.bat` / `install.sh` já instalam as dependências certas automaticamente. Se quiser instalar manualmente com o Python embedded:
+Modos rápidos:
 
 ```text
-cd C:\Users\nyckm\Documents\c3\ComfyUI-Easy-Install
-.\python_embeded\python.exe -m pip install opencv-python onnx requests tqdm huggingface_hub psutil
+install.bat --deps-only
+install.bat --skip-models
 ```
 
-> **Nunca** rode `pip` solto (resolve pro Python errado) nem instale `xformers`/`flash-attn`.
+O instalador encontra o Python do ComfyUI, instala as dependências e escolhe o `onnxruntime-gpu` compatível com a CUDA do PyTorch. Ele não altera diretamente `torch`, `numpy`, `triton`, `xformers` ou `flash-attn`. Reinicie o ComfyUI e pressione `F5`.
 
-Os `.onnx` (swapper, scrfd, arcface, xseg, bisenet) baixam sozinhos no 1º uso, para `ComfyUI/models/facefusion/`.
+## Nodes novos
 
-Encaixe típico:
-```text
-Load Image (rosto novo) ─→ source_face ─┐
-Load Video ─────────────→ target_images ─┴→ FaceFusion Swap ─images→ Save Video
-                                              └─face_mask→ Bernini Infinity (region_mask)
-```
+### Imagem e vídeo
 
----
+| Node | Função |
+|---|---|
+| **Load Image + Crop** | Preview em tempo real, crop visual, presets de proporção, resize/pad/stretch, rotação e flip horizontal/vertical. |
+| **Load Video** | Carrega vídeo, áudio e metadados; limita, pula, inverte ou reamostra frames e pode criar cache. |
+| **Save Video** | Exporta H.264/H.265/VP9/ProRes, áudio e sequência PNG, verificando frames inválidos. |
 
-## Memória (VRAM/RAM)
+### Inpaint e composição
 
-**`limpar_vram`**
+| Node | Função |
+|---|---|
+| **Flux2 Klein Inpaint + Outpaint** | Usa máscara branca para preencher com Klein Base + LoRA; aceita uma segunda imagem como referência visual. |
+| **Máscara → BBox → Recorte** | Recorta somente a região da máscara para processar menos pixels. |
+| **Stitch pelo BBox** | Recoloca o resultado no quadro original com máscara e feather. |
+| **Composite & Refine** | Compõe uma referência sobre o vídeo e produz a máscara de refinamento. |
+| **Chromakey** | Chroma/luma key, despill, matte externo e composição de fundo. |
 
-| Valor | O que faz | Quando usar |
-|---|---|---|
-| `off` | Sem limpeza entre passos. | Raramente. |
-| `leve` *(padrão)* | `gc.collect()` + esvazia cache da VRAM. Barato e seguro. | **Uso geral.** |
-| `agressivo` | Também descarrega os modelos entre os passos → menor pico de VRAM. | Só se estourar VRAM. |
+### Tracking e rosto
 
-> 🛡️ **Guard automático:** se o modelo tem muitos patches (LoRA = centenas), descarregar **entre passos** obriga a refazer o staging de GBs e re-aplicar todos os patches — custa muito mais do que economiza sob DynamicVRAM. O `agressivo` vira `leve` automaticamente nesse caso e avisa no console.
+| Node | Função |
+|---|---|
+| **Tracked Crop / SAM3** | Segue a máscara por frame e suaviza separadamente centro e tamanho do crop. |
+| **Tracked Stitch** | Reencaixa o crop editado com feather, blend e correção de cor. |
+| **H3 Face Denoise por Frame** | Usa mais denoise em rostos pequenos e preserva rostos grandes sem alterar a máscara de áudio. |
+| **AutoEdit Router / Mask** | Transforma uma instrução em alvo, prompt de edição e máscara rastreada pelo SAM3. |
 
-**`force_unload_between_passes`** *(anti-OOM)* — descarrega o modelo **high** da VRAM **antes** do passo **low**, **ignorando o guard de LoRA** acima. Ligue quando der **OOM exatamente na transição high→low**: é o sinal de que os dois modelos não cabem juntos na placa (ex.: Bernini-R INT8 14B ≈ 14 GB *cada* numa placa de 22 GB → 28 GB > 22 GB). Custa um re-stage por passo (mais lento), mas remove o pico de dois modelos ao mesmo tempo. Deixe **desligado** se você não está com OOM. *(Obs.: várias GPUs **não** somam VRAM — um render roda numa placa só; o teto é a VRAM de uma delas.)*
+### Movimento
 
-**`monitor_memoria`** — imprime RAM e VRAM em tempo real no console. Precisa de CUDA (VRAM) e `psutil` (RAM).
+| Node | Função |
+|---|---|
+| **Motion Analyzer** | Mede movimento entre frames e cria um mapa temporal. |
+| **Motion Timeline** | Edita intensidade e hold do movimento ao longo do vídeo. |
+| **Motion Time Smear** | Distribui frames rápidos para reduzir saltos temporais. |
+| **Motion Recover** | Recupera a duração original depois do processamento. |
 
----
+### MiniMax H3
 
-## `sequential` vs `context_window`
+| Node | Função |
+|---|---|
+| **H3 Loader tudo-em-um** | Carrega transformer, text encoder e os VAEs de vídeo e áudio. |
+| **H3 Frames** | Calcula comprimentos válidos `17k+5` e ajusta a referência. |
+| **H3 Prompt Rápido** | Expande macros `@` e `#` para prompts estruturados. |
+| **H3 Context-IR / Referência** | Organiza ideia, câmera, ação, áudio e referências no formato do H3. |
+| **H3 Força do Condicionamento** | Controla quanto o H3 segue vídeo e referências. |
+| **H3 Latent Upscale 2-pass** | Amplia o latent entre samplers e ajusta as referências. |
+| **H3 Row Chunk Exato** | Divide QKV/MLP em linhas para reduzir o pico de memória sem aproximação. |
+| **H3 Reference Isolate** | Impede referências de consultarem o alvo ruidoso durante parte do denoise. |
+| **H3 Bloco / Memória Rolante** | Processa vídeos longos mantendo cauda e memória visual. |
+| **H3 Latent SSD** | Salva, lê, separa e recompõe vídeo/áudio latente no SSD. |
+| **H3 Clay Reference Auto** | Combina referência principal e clay em resolução e tempos adequados. |
 
-| | `sequential` | `context_window` |
-|---|---|---|
-| Como processa | Chunks em sequência, avançando `chunk_size − overlap` | Vídeo inteiro, com janela deslizante |
-| VRAM | Mais econômico | Um pouco mais pesado |
-| `mask_mode: bbox` | ❌ (cai pra `inpaint`) | ✅ |
-| Continuidade | Boa, via `tail_memory` | Melhor (nativa) |
-| Quando usar | Vídeo muito longo / VRAM curta | Vídeo cabe numa geração, ou quer `bbox` |
+### Tiles e SSD
 
-⚠️ `chunk_size` pequeno com `overlap` grande multiplica passagens. O `chunk_size` define a janela de atenção — quando o vídeo ultrapassa esse limite, o Wan roda **múltiplas janelas por step** e o `s/it` sobe linearmente. Se o `s/it` aumentar com vídeos mais longos, aumente o `chunk_size` para cobrir o vídeo inteiro (próximo 4n+1 acima do número de frames).
+| Node | Função |
+|---|---|
+| **Video Tiler** | Divide vídeo e referências por tile e recompõe em alta resolução. |
+| **Tile Color Match** | Iguala cor e contraste entre tiles. |
+| **Seam-Aware Video Tile Merge** | Busca o alinhamento de menor erro no overlap para reduzir emendas. |
+| **Custom Tile Layout / Slice** | Desenha uma grade personalizada e produz os recortes. |
+| **Video/Images → Disk Cache** | Grava frames no SSD para reduzir uso de RAM. |
+| **Disk Cache → Window** | Lê apenas a janela necessária, com overlap e prefetch. |
+| **Bernini Infinity SSD 81** | Processa Bernini em blocos de 81 frames usando cache e tail. |
 
-**`mask_mode`:** `off` (regenera tudo) · `inpaint` (edita só a área da máscara) · `bbox` (recorta a região e gera em resolução menor — só em `context_window`).
+### Bernini e Wan
 
-**`bbox_compose`:** `silhouette` usa a silhueta da máscara como alpha; `rectangle` cola o retângulo inteiro com feather, eliminando a "linha" de contorno.
+| Node | Função |
+|---|---|
+| **Bernini Infinity** | Vídeo longo com chunks, overlap, máscara e memória de cauda. |
+| **Bernini Infinity Tiled / Optimized** | Executa por ladrilho; a versão Optimized reduz encode/decode e trocas de modelo. |
+| **Bernini TeaCache** | Reaproveita blocos semelhantes para acelerar a inferência. |
+| **Block Swap RAM Offload** | Move blocos para RAM quando o modelo não cabe na VRAM. |
+| **Bernini I2V / Ref-to-Video** | Gera vídeo a partir de imagem sem `source_video`. |
+| **Wan Tiled Upscale** | Upscale Wan com tiles, janelas temporais e cache. |
 
----
+## Dependências opcionais
 
-## Changelog
+- **ComfyUI-WanVideoWrapper:** MoCha e WanVideo Context.
+- **ComfyUI-LTXVideo:** samplers LTX.
+- **SAM3/easy-use:** workflows que usam segmentação SAM3.
+- **FlashAttention:** opcional; deve corresponder à versão de CUDA/PyTorch.
 
-- **0.2** — correção automática de frames 4n+1 (padding espelhado + corte de volta); `mask_mode`, `mask_grow`, `mask_blur`.
-- **0.3** — `FaceStitchUpscale`.
-- **0.5** — Load/Save Video com tipo `VIDEO` nativo.
-- **0.6–0.9** — suíte de utilitários próprios, Comparar Vídeos A/B, Prever BBox, Config de Upscale / Blend de Batches.
-- **0.10** — Editor de Pontos SAM3.
-- **0.11** — `bbox_compose` (`silhouette`/`rectangle`); máscara acompanha o `resize_mode`.
-- **0.12** — troca de rosto local (ONNX) incluída no pacote.
-- **0.13** — **gerenciamento de memória**: limpeza de VRAM entre high/low e entre blocos, com **guard contra re-stage/re-patch** sob DynamicVRAM. Widgets `limpar_vram` e `monitor_memoria`.
-- **0.14** — **reasoning do paper**: `Bernini Prompt Enhancer` (self-text CoT via Qwen local), `First-Frame CoT` (self-vision-text), `Bernini Multi-Guidance` (eq. 8–12, experimental). Prompt Guide expandido para as 22 tarefas do Bernini-Bench (35 presets).
-- **0.15** — **MoCha** (`Mocha Embeds` + `Mocha Info`), com fix de frames que o node original não tem. **Save Video** blindado (normaliza tensores malformados; denuncia NaN e vídeo preto). **Instalador refeito**: modelos Bernini-R INT8 ConvRot + LoRAs LightX2V 4-step, detecção automática de CUDA para o `onnxruntime-gpu`, downloads idempotentes.
-- **0.16** — **Tile Split / Select / Accumulate / Merge**: corte por contagem com tamanho automático, alinhamento a múltiplo de 16, costura com feather e detecção de upscale.
-- **0.17** — **Wan Tiled Sampler** (step-fused guider): tile no latente com janela Hann complementar — funciona pra T2V puro; com `context_latents` (V2V) desliga automaticamente com aviso.
-- **0.18** — `guidance_mode=tiled` integrado ao Bernini Infinity (mesma proteção automática). Guard de re-stage/re-patch no `limpar_vram=agressivo` corrigido.
-- **0.19** — **Bernini Infinity Tiled**: tile em pixels com pipeline COMPLETO por ladrilho, costura viva e três modos (`off` / `inpaint` / `bbox`). O modo `bbox` faz duplo recorte (tile + bounding box da máscara dentro do tile) — até **9,6× mais rápido** que `inpaint` e **38×** que `off` quando o objeto é pequeno. **Load Video**: widget `reverse` (inverte os frames).
-- **0.20** — **Bernini Infinity Tiled Optimized** (`latent_encode_once` + `decode_once` no `off` e no `bbox` + `agrupar_high_low` que troca de modelo 1× por fase em vez de por tile; clone único do ModelPatcher por fase; log do backend de atenção). **LTX Tiled Sampler** (step-fused para o modelo LTX, com timer). **Mocha BBox Crop / Stitch** (roda o MoCha só na região do sujeito — bbox + faixa temporal — respeitando o rastreamento por máscara única do modelo). **WanVideo Context** (janelas temporais anti-OOM para o WanVideo Sampler, Python puro). **`force_unload_between_passes`** no Bernini Infinity: descarrega o high antes do low furando o guard de LoRA, para OOM na transição high→low em placa única (issue #9). **Bernini I2V / Ref-to-Video**: gera vídeo de uma imagem de referência sem `source_video` (KSampler embutido, split high/low), espelhando o `BerniniConditioning` oficial no modo i2v. Correção no `__init__`: o módulo `bernini_tiled_kv_temporal_experimental` estava com `.py` no nome e nunca carregava.
+Os modelos ONNX do FaceFusion são baixados no primeiro uso para `ComfyUI/models/facefusion`.
 
----
+## Modelos baixados pelo instalador
 
-## Por que não há um "Bernini Long Sampler"?
+- Bernini-R HIGH/LOW INT8 ConvRot → `models/diffusion_models`
+- LoRAs Bernini LightX2V HIGH/LOW → `models/loras`
+- UMT5 XXL FP8 → `models/text_encoders`
+- Wan 2.1 Video VAE → `models/vae`
 
-Porque o Bernini já passa contexto pelo `conditioning`, e o patch Wan já aceita `context_latents` como lista. O ponto que precisa ser robusto é *gerar os conditionings certos*:
+Flux2 Klein não é baixado automaticamente. Selecione manualmente Klein Base 4B, `flux2-vae`, Qwen 3 4B e a LoRA de outpaint.
 
-```python
-context_latents = [encoded_chunk, tail_latent]
-```
+## Workflows e licença
 
-Assim o pacote aproveita a arquitetura nativa em vez de clonar um sampler inteiro — fica isolado e compatível com workflows já existentes.
-
----
-
-## 🙏 Agradecimentos
-
-Baseado em nodes do **Kijai** e nos modelos **Bernini** (ByteDance). O módulo de troca de rosto reconstrói o [FaceFusion ComfyUI](https://github.com/huygiatrng/Facefusion_comfyui) (huygiatrng) em modo local. Os nodes de MoCha se apoiam no [MoCha](https://github.com/Orange-3DV-Team/MoCha) (Orange-3DV-Team) e no [ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper) (Kijai) — o `WanVideo Context` gera o `context_options` que o sampler do wrapper consome. O `Bernini Infinity Tiled` foi inspirado pelo [comfyUI-TiledWan](https://github.com/Baverne/comfyUI-TiledWan) (Baverne). Os `Wan Tiled Sampler` e `LTX Tiled Sampler` foram inspirados pelo [comfyui-deno-custom-nodes](https://github.com/Deno2026/comfyui-deno-custom-nodes) (Deno2026); o LTX dialoga com o [ComfyUI-LTXVideo](https://github.com/Lightricks/ComfyUI-LTXVideo) (Lightricks). Obrigado aos autores e à comunidade.
-
-## 📄 Licença
-
-Apache License 2.0. A parte FaceFusion (pasta `facefusion/`) é MIT (engine ONNX vendorizado). **Respeite as licenças dos modelos**: vários swappers são non-commercial (InsightFace); os `ghost_*` são Apache-2.0.
+Exemplos ficam em [`workflows`](workflows). Licença Apache-2.0; adaptações externas mantêm a atribuição indicada no código.
