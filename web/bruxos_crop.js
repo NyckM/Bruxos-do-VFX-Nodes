@@ -5,13 +5,9 @@ import { api } from "../../scripts/api.js";
 // tanto no canvas legado quanto no frontend Nodes 2.0 do ComfyUI.
 console.log("[Bruxos] preview/crop de imagem carregado");
 
-const PREVIEW_MAX_H = 300;
-const PREVIEW_MIN_H = 130;
+const PREVIEW_MAX_H = 480;
+const PREVIEW_MIN_H = 240;
 const MIN_CROP_PX = 18;
-const SERIALIZED_INPUTS = [
-  "image", "fit_mode", "target_width", "target_height", "aspect",
-  "crop_x", "crop_y", "crop_w", "crop_h", "image_path",
-];
 const ASPECTS = {
   "1:1": 1,
   "3:4": 3 / 4,
@@ -26,31 +22,42 @@ function widget(node, name) {
   return node.widgets?.find((w) => w.name === name);
 }
 
-// O frontend hibrido 1.x/Nodes 2.0 desta instalacao ainda restaura
-// widgets_values por indice, incluindo widgets DOM/botoes que deveriam ser
-// nao-serializaveis. Reaplica os 10 valores oficiais pelo NOME do input.
-function restoreSerializedInputs(node, config) {
-  const saved = config?.widgets_values;
-  if (!Array.isArray(saved) || saved.length < SERIALIZED_INPUTS.length) return;
+function isVueNodes() {
+  return !!window.LiteGraph?.vueNodesMode;
+}
 
-  // Workflow valido do backend: estes tipos/combos funcionam como assinatura.
-  const valid =
-    typeof saved[0] === "string" &&
-    typeof saved[1] === "string" &&
-    ["off (original)", "crop", "stretch", "pad (letterbox)"].includes(saved[1]) &&
-    Number.isFinite(Number(saved[2])) &&
-    Number.isFinite(Number(saved[3])) &&
-    typeof saved[4] === "string" &&
-    Number.isFinite(Number(saved[5])) &&
-    Number.isFinite(Number(saved[6])) &&
-    Number.isFinite(Number(saved[7])) &&
-    Number.isFinite(Number(saved[8]));
-  if (!valid) return;
-
-  SERIALIZED_INPUTS.forEach((name, index) => {
-    const w = widget(node, name);
-    if (w) w.value = saved[index];
+// No Nodes 1.0 o widget deve ser canvas-only para nao aparecer tambem na aba
+// Parameters. No Nodes 2.0 canvasOnly precisa ser false, senao o Vue exclui o
+// DOMWidget do corpo do node. O getter permite trocar o renderer sem recriar o
+// widget.
+function applyRendererVisibility(widget) {
+  if (!widget?.options) return;
+  Object.defineProperty(widget.options, "canvasOnly", {
+    configurable: true,
+    enumerable: true,
+    get: () => !isVueNodes(),
   });
+}
+
+function placePreviewBeforeAdvanced(node, previewWidget, selectorName) {
+  if (!isVueNodes() || !Array.isArray(node.widgets)) return;
+  const uploadWidgets = node.widgets.filter((item) => {
+    const text = `${item?.name || ""} ${item?.label || ""}`.toLowerCase();
+    return item?.type === "button" && (text.includes("upload") || text.includes("escolher"));
+  });
+  const movers = [...uploadWidgets, previewWidget];
+  const ordered = node.widgets.filter((item) => !movers.includes(item));
+  const selectorIndex = ordered.findIndex((item) => item.name === selectorName);
+  ordered.splice(Math.max(0, selectorIndex + 1), 0, ...movers);
+  node.widgets.splice(0, node.widgets.length, ...ordered);
+  node._widgetSlotsDirty = true;
+  const finishLayout = () => {
+    if (!node.graph) return;
+    node.arrange?.();
+    node.setDirtyCanvas?.(true, true);
+  };
+  if (node.graph) finishLayout();
+  else requestAnimationFrame(finishLayout);
 }
 
 function value(node, name, fallback) {
@@ -103,6 +110,74 @@ function actualAspect(node) {
   return ASPECTS[preset] || null;
 }
 
+function rotationDegrees(node) {
+  const selected = String(widget(node, "girar")?.value || "off");
+  if (selected.startsWith("-90")) return -90;
+  if (selected.startsWith("90")) return 90;
+  if (selected.startsWith("180")) return 180;
+  return 0;
+}
+
+function boolValue(node, name) {
+  return widget(node, name)?.value === true;
+}
+
+function orientedDimensions(node) {
+  const meta = node._bruxosImageMeta;
+  if (!meta?.width || !meta?.height) return null;
+  return Math.abs(rotationDegrees(node)) === 90
+    ? { width: meta.height, height: meta.width }
+    : { width: meta.width, height: meta.height };
+}
+
+// O backend gira antes de aplicar crop/fit. O preview materializa a mesma
+// orientacao em um canvas auxiliar, reutilizado enquanto imagem e giro forem os mesmos.
+function orientedSource(node) {
+  const preview = node._bruxosImagePreview;
+  const image = preview?.image;
+  if (!image?.complete || !image.naturalWidth) return null;
+  const degrees = rotationDegrees(node);
+  const flipH = boolValue(node, "flip_horizontal");
+  const flipV = boolValue(node, "flip_vertical");
+  const key = `${image.src}|${image.naturalWidth}x${image.naturalHeight}|${degrees}|${flipH}|${flipV}`;
+  if (preview.orientedCanvas && preview.orientedKey === key) return preview.orientedCanvas;
+
+  const source = document.createElement("canvas");
+  const quarterTurn = Math.abs(degrees) === 90;
+  source.width = quarterTurn ? image.naturalHeight : image.naturalWidth;
+  source.height = quarterTurn ? image.naturalWidth : image.naturalHeight;
+  const ctx = source.getContext("2d");
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  if (degrees === 90) {
+    ctx.translate(source.width, 0);
+    ctx.rotate(Math.PI / 2);
+  } else if (degrees === -90) {
+    ctx.translate(0, source.height);
+    ctx.rotate(-Math.PI / 2);
+  } else if (degrees === 180) {
+    ctx.translate(source.width, source.height);
+    ctx.rotate(Math.PI);
+  }
+  ctx.drawImage(image, 0, 0);
+
+  let result = source;
+  if (flipH || flipV) {
+    result = document.createElement("canvas");
+    result.width = source.width;
+    result.height = source.height;
+    const flipped = result.getContext("2d");
+    flipped.imageSmoothingEnabled = true;
+    flipped.imageSmoothingQuality = "high";
+    flipped.translate(flipH ? result.width : 0, flipV ? result.height : 0);
+    flipped.scale(flipH ? -1 : 1, flipV ? -1 : 1);
+    flipped.drawImage(source, 0, 0);
+  }
+  preview.orientedCanvas = result;
+  preview.orientedKey = key;
+  return result;
+}
+
 function clampBox(box) {
   box.w = Math.max(0.01, Math.min(1, box.w));
   box.h = Math.max(0.01, Math.min(1, box.h));
@@ -132,8 +207,8 @@ function commitBox(node, box) {
 
 function fitPreset(node, keepCenter = true) {
   const ratio = actualAspect(node);
-  const meta = node._bruxosImageMeta;
-  if (!ratio || !meta?.width || !meta?.height) {
+  const dims = orientedDimensions(node);
+  if (!ratio || !dims?.width || !dims?.height) {
     render(node);
     return;
   }
@@ -141,7 +216,7 @@ function fitPreset(node, keepCenter = true) {
   const cx = keepCenter ? old.x + old.w / 2 : 0.5;
   const cy = keepCenter ? old.y + old.h / 2 : 0.5;
   // Normalized width/height is not the pixel aspect. Correct by source W/H.
-  const normalizedRatio = ratio * meta.height / meta.width;
+  const normalizedRatio = ratio * dims.height / dims.width;
   let w = old.w;
   let h = w / normalizedRatio;
   if (h > 1) {
@@ -157,14 +232,33 @@ function fitPreset(node, keepCenter = true) {
 
 function canvasGeometry(node) {
   const p = node._bruxosImagePreview;
-  const meta = node._bruxosImageMeta;
-  if (!p || !meta?.width || !meta?.height) return null;
+  const dims = orientedDimensions(node);
+  if (!p || !dims?.width || !dims?.height) return null;
   const W = p.canvas.width;
   const H = p.canvas.height;
-  const scale = Math.min(W / meta.width, H / meta.height);
-  const iw = meta.width * scale;
-  const ih = meta.height * scale;
+  const scale = Math.min(W / dims.width, H / dims.height);
+  const iw = dims.width * scale;
+  const ih = dims.height * scale;
   return { x: (W - iw) / 2, y: (H - ih) / 2, w: iw, h: ih };
+}
+
+function fittedRect(W, H, aspect, padding = 8) {
+  const maxW = Math.max(1, W - padding * 2);
+  const maxH = Math.max(1, H - padding * 2);
+  let w = maxW;
+  let h = w / aspect;
+  if (h > maxH) {
+    h = maxH;
+    w = h * aspect;
+  }
+  return { x: (W - w) / 2, y: (H - h) / 2, w, h };
+}
+
+function outputAspect(node, sourceAspect) {
+  const tw = value(node, "target_width", 0);
+  const th = value(node, "target_height", 0);
+  // _target_from_one no Python preserva o aspecto quando apenas um lado existe.
+  return tw > 0 && th > 0 ? tw / th : sourceAspect;
 }
 
 function drawCrop(ctx, g, box, active) {
@@ -220,15 +314,16 @@ function renderInfo(node) {
     p.info.textContent = "";
     return;
   }
+  const dims = orientedDimensions(node) || m;
   const b = currentBox(node);
-  const cw = Math.max(1, Math.round(m.width * b.w));
-  const ch = Math.max(1, Math.round(m.height * b.h));
+  const cw = Math.max(1, Math.round(dims.width * b.w));
+  const ch = Math.max(1, Math.round(dims.height * b.h));
   const tw = value(node, "target_width", 0);
   const th = value(node, "target_height", 0);
   const fit = String(widget(node, "fit_mode")?.value || "off").split(" ")[0];
   const output = tw || th ? ` · saída ${tw || "auto"}×${th || "auto"}` : "";
   p.info.innerHTML =
-    `<span>${m.width} × ${m.height} px</span>` +
+    `<span>${dims.width} × ${dims.height} px</span>` +
     `<span>${m.format}</span>` +
     `<span>crop ${cw} × ${ch}${output}</span>` +
     `<span>${fit}</span>`;
@@ -246,9 +341,29 @@ function render(node) {
   ctx.fillStyle = "#111";
   ctx.fillRect(0, 0, W, H);
   const g = canvasGeometry(node);
-  if (g && p.image.complete && p.image.naturalWidth) {
-    ctx.drawImage(p.image, g.x, g.y, g.w, g.h);
-    drawCrop(ctx, g, currentBox(node), String(widget(node, "fit_mode")?.value).startsWith("crop"));
+  const source = orientedSource(node);
+  if (g && source) {
+    const mode = String(widget(node, "fit_mode")?.value || "off").split(" ")[0];
+    const sourceAspect = source.width / source.height;
+    if (mode === "stretch") {
+      const stage = fittedRect(W, H, outputAspect(node, sourceAspect));
+      ctx.drawImage(source, stage.x, stage.y, stage.w, stage.h);
+      ctx.strokeStyle = "rgba(168,85,247,.8)";
+      ctx.strokeRect(stage.x, stage.y, stage.w, stage.h);
+    } else if (mode === "pad") {
+      const stage = fittedRect(W, H, outputAspect(node, sourceAspect));
+      ctx.fillStyle = "#000";
+      ctx.fillRect(stage.x, stage.y, stage.w, stage.h);
+      const scale = Math.min(stage.w / source.width, stage.h / source.height);
+      const iw = source.width * scale;
+      const ih = source.height * scale;
+      ctx.drawImage(source, stage.x + (stage.w - iw) / 2, stage.y + (stage.h - ih) / 2, iw, ih);
+      ctx.strokeStyle = "rgba(168,85,247,.8)";
+      ctx.strokeRect(stage.x, stage.y, stage.w, stage.h);
+    } else {
+      ctx.drawImage(source, g.x, g.y, g.w, g.h);
+      if (mode === "crop") drawCrop(ctx, g, currentBox(node), true);
+    }
   } else {
     ctx.fillStyle = "#999";
     ctx.font = "12px sans-serif";
@@ -302,7 +417,8 @@ function resizeFromDrag(node, drag, dx, dy) {
 
   const ratio = actualAspect(node);
   if (ratio) {
-    const nr = ratio * node._bruxosImageMeta.height / node._bruxosImageMeta.width;
+    const dims = orientedDimensions(node) || node._bruxosImageMeta;
+    const nr = ratio * dims.height / dims.width;
     const anchorX = drag.mode.includes("w") ? right : left;
     const anchorY = drag.mode.includes("n") ? bottom : top;
     let w = right - left, h = bottom - top;
@@ -360,32 +476,44 @@ function installPointerEvents(node, canvas) {
 function resizeCanvas(node) {
   const p = node._bruxosImagePreview;
   if (!p) return;
-  // Nodes 2.0 aplica uma transformacao inversa aos DOMWidgets. Sem compensar
-  // o zoom do graph, o canvas DOM fica maior que a moldura do node.
-  const graphScale = Math.max(0.1, Number(app.canvas?.ds?.scale) || 1);
-  const logicalWidth = Math.max(180, (node.size?.[0] || 300) - 28);
-  const cssWidth = logicalWidth * graphScale;
-  const aspect = node._bruxosImageMeta
-    ? node._bruxosImageMeta.width / node._bruxosImageMeta.height : 16 / 9;
-  const logicalHeight = Math.min(
+  // O frontend ja transforma DOMWidgets junto com o graph. Use somente as
+  // dimensoes CSS realmente entregues pelo layout; aplicar ds.scale aqui
+  // compensava o zoom duas vezes e descolava o preview da moldura do node.
+  const cssWidth = Math.max(1, p.wrap.clientWidth || (node.size?.[0] || 300) - 28);
+  const dims = orientedDimensions(node);
+  const aspect = dims ? dims.width / dims.height : 16 / 9;
+  const cssHeight = Math.round(Math.min(
     PREVIEW_MAX_H,
-    Math.max(PREVIEW_MIN_H, logicalWidth / aspect)
-  );
-  const cssHeight = Math.round(logicalHeight * graphScale);
+    Math.max(PREVIEW_MIN_H, cssWidth / aspect)
+  ));
   const dpr = Math.min(2, window.devicePixelRatio || 1);
-  p.canvas.style.width = cssWidth + "px";
+  p.canvas.style.width = "100%";
   p.canvas.style.height = cssHeight + "px";
   const nextW = Math.round(cssWidth * dpr), nextH = Math.round(cssHeight * dpr);
   if (p.canvas.width !== nextW || p.canvas.height !== nextH) {
     p.canvas.width = nextW;
     p.canvas.height = nextH;
   }
-  if (p.wrap.parentElement) {
-    p.wrap.parentElement.style.width = cssWidth + "px";
-    p.wrap.parentElement.style.maxWidth = cssWidth + "px";
-    p.wrap.parentElement.style.overflow = "hidden";
-  }
   render(node);
+}
+
+function previewHeight(node, width) {
+  const contentWidth = Math.max(180, (Number(width) || node.size?.[0] || 300) - 28);
+  const dims = orientedDimensions(node);
+  const aspect = dims ? dims.width / dims.height : 16 / 9;
+  return Math.min(PREVIEW_MAX_H, Math.max(PREVIEW_MIN_H, contentWidth / aspect)) +
+    31;
+}
+
+function resizeNodeToContent(node) {
+  requestAnimationFrame(() => {
+    const computed = node.computeSize?.();
+    if (!computed) return;
+    const width = Math.max(Number(node.size?.[0]) || 0, Number(computed[0]) || 0);
+    const height = Math.max(120, Number(computed[1]) || 0);
+    node.setSize?.([width, height]);
+    node.setDirtyCanvas?.(true, true);
+  });
 }
 
 function loadSelectedImage(node) {
@@ -414,8 +542,7 @@ function loadSelectedImage(node) {
     };
     fitPreset(node);
     resizeCanvas(node);
-    node.setSize?.(node.computeSize());
-    node.setDirtyCanvas?.(true, true);
+    resizeNodeToContent(node);
   };
   p.image.onerror = () => {
     node._bruxosImageMeta = null;
@@ -428,10 +555,12 @@ function loadSelectedImage(node) {
 function ensurePreview(node) {
   if (node._bruxosImagePreview) return node._bruxosImagePreview;
   const wrap = document.createElement("div");
-  wrap.style.cssText = "width:100%;box-sizing:border-box;padding:0 2px;overflow:hidden;";
+  wrap.style.cssText =
+    "width:100%;max-width:100%;min-width:0;box-sizing:border-box;" +
+    "padding:0 2px;overflow:hidden;contain:layout;";
   const canvas = document.createElement("canvas");
   canvas.style.cssText =
-    "display:block;max-width:100%;background:#111;border:1px solid #3b3b44;" +
+    "display:block;width:100%;max-width:100%;min-width:0;background:#111;border:1px solid #3b3b44;" +
     "border-radius:7px;box-sizing:border-box;touch-action:none;";
   const info = document.createElement("div");
   info.style.cssText =
@@ -441,29 +570,48 @@ function ensurePreview(node) {
   image.decoding = "async";
   wrap.append(canvas, info);
 
+  const measureHeight = () => previewHeight(node, node.size?.[0]);
   const domWidget = node.addDOMWidget("bruxos_image_crop_preview", "preview", wrap, {
     serialize: false,
     hideOnZoom: false,
+    getMinHeight: measureHeight,
+    getMaxHeight: measureHeight,
+    margin: 0,
   });
   domWidget.serialize = false;
   domWidget.serializeValue = () => undefined;
   // IMPORTANTE: mantenha este widget DEPOIS dos widgets de entrada. Versoes
   // antigas/hibritas do frontend ignoram serialize:false ao restaurar
   // widgets_values; inserir o preview antes deles desloca todos os valores.
-  domWidget.computeSize = (width) => {
-    const cssWidth = Math.max(180, (node.size?.[0] || width || 300) - 28);
-    const aspect = node._bruxosImageMeta
-      ? node._bruxosImageMeta.width / node._bruxosImageMeta.height : 16 / 9;
-    return [width, Math.min(PREVIEW_MAX_H, Math.max(PREVIEW_MIN_H, cssWidth / aspect)) + 31];
-  };
+  domWidget.computeSize = (width) => [width, previewHeight(node, width)];
+  if (isVueNodes()) {
+    domWidget.computeLayoutSize = () => ({
+      minWidth: 1,
+      minHeight: measureHeight(),
+      maxHeight: measureHeight(),
+    });
+  }
+  domWidget.getHeight = measureHeight;
+  applyRendererVisibility(domWidget);
   node._bruxosImagePreview = { wrap, canvas, info, image, widget: domWidget, message: "" };
+  placePreviewBeforeAdvanced(node, domWidget, "image");
   installPointerEvents(node, canvas);
+  if (typeof ResizeObserver !== "undefined") {
+    node._bruxosImagePreview.resizeObserver = new ResizeObserver(() => resizeCanvas(node));
+    node._bruxosImagePreview.resizeObserver.observe(wrap);
+  }
   resizeCanvas(node);
   return node._bruxosImagePreview;
 }
 
 function hookNode(node) {
   ensurePreview(node);
+  const originalResize = node.onResize;
+  node.onResize = function () {
+    const result = originalResize?.apply(this, arguments);
+    requestAnimationFrame(() => resizeCanvas(this));
+    return result;
+  };
   const refreshNames = [
     "crop_x", "crop_y", "crop_w", "crop_h",
     "target_width", "target_height", "fit_mode",
@@ -474,7 +622,7 @@ function hookNode(node) {
     const original = w.callback;
     w.callback = function () {
       const result = original?.apply(this, arguments);
-      render(node);
+      requestAnimationFrame(() => render(node));
       return result;
     };
   }
@@ -483,7 +631,46 @@ function hookNode(node) {
     const original = aspectWidget.callback;
     aspectWidget.callback = function () {
       const result = original?.apply(this, arguments);
-      fitPreset(node);
+      // Nodes 2.0 atualiza o valor reativo logo depois do callback. Aguarde um
+      // frame para calcular com a proporcao nova, nao com a anterior.
+      requestAnimationFrame(() => fitPreset(node));
+      return result;
+    };
+  }
+  const rotateWidget = widget(node, "girar");
+  if (rotateWidget) {
+    const original = rotateWidget.callback;
+    rotateWidget.callback = function () {
+      const result = original?.apply(this, arguments);
+      requestAnimationFrame(() => {
+        const preview = node._bruxosImagePreview;
+        if (preview) {
+          preview.orientedCanvas = null;
+          preview.orientedKey = null;
+        }
+        // Um quarto de volta troca largura e altura; atualize canvas e box.
+        fitPreset(node);
+        resizeCanvas(node);
+        resizeNodeToContent(node);
+      });
+      return result;
+    };
+  }
+  for (const name of ["flip_horizontal", "flip_vertical"]) {
+    const flipWidget = widget(node, name);
+    if (!flipWidget) continue;
+    const original = flipWidget.callback;
+    flipWidget.callback = function () {
+      const result = original?.apply(this, arguments);
+      requestAnimationFrame(() => {
+        const preview = node._bruxosImagePreview;
+        if (preview) {
+          preview.orientedCanvas = null;
+          preview.orientedKey = null;
+        }
+        render(node);
+        node.setDirtyCanvas?.(true, true);
+      });
       return result;
     };
   }
@@ -498,12 +685,6 @@ function hookNode(node) {
     };
   }
 
-  const originalDraw = node.onDrawForeground;
-  node.onDrawForeground = function () {
-    const result = originalDraw?.apply(this, arguments);
-    resizeCanvas(this);
-    return result;
-  };
   loadSelectedImage(node);
 }
 
@@ -518,23 +699,19 @@ app.registerExtension({
       return result;
     };
     const originalConfigure = nodeType.prototype.onConfigure;
-    nodeType.prototype.onConfigure = function (config) {
+    nodeType.prototype.onConfigure = function () {
       const result = originalConfigure?.apply(this, arguments);
-      // Corrige imediatamente e novamente no proximo tick, pois alguns
-      // wrappers do frontend terminam a restauracao depois do onConfigure.
-      restoreSerializedInputs(this, config);
       setTimeout(() => {
-        restoreSerializedInputs(this, config);
         loadSelectedImage(this);
       }, 0);
       setTimeout(() => {
-        restoreSerializedInputs(this, config);
         loadSelectedImage(this);
       }, 80);
       return result;
     };
     const originalRemoved = nodeType.prototype.onRemoved;
     nodeType.prototype.onRemoved = function () {
+      this._bruxosImagePreview?.resizeObserver?.disconnect();
       this._bruxosImagePreview?.image?.removeAttribute("src");
       return originalRemoved?.apply(this, arguments);
     };

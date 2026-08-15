@@ -78,28 +78,23 @@ function ensureUI(node) {
   wrap.style.maxWidth = "100%";
   wrap.style.boxSizing = "border-box";
   wrap.style.overflow = "hidden";
-  const widget = node.addDOMWidget("bruxos_compare_ui", "compare", wrap, { serialize: false });
-  widget.computeSize = (w) => [w, H + 76];
-
-  // No Node 2.0 o container pai do DOMWidget pode ficar mais largo que o node
-  // e o player vaza pela lateral. Forca, a cada desenho, a largura do wrap a
-  // acompanhar a largura REAL do node (menos a margem da moldura).
-  const _origDraw = node.onDrawForeground;
-  node.onDrawForeground = function (ctx) {
-    const r = _origDraw ? _origDraw.apply(this, arguments) : undefined;
-    try {
-      const alvo = Math.max(120, (this.size?.[0] || 240) - 26);
-      if (wrap.parentElement) {
-        wrap.parentElement.style.width = alvo + "px";
-        wrap.parentElement.style.maxWidth = alvo + "px";
-        wrap.parentElement.style.overflow = "hidden";
-        wrap.parentElement.style.boxSizing = "border-box";
-      }
-      wrap.style.width = alvo + "px";
-      wrap.style.maxWidth = alvo + "px";
-    } catch (e) {}
-    return r;
-  };
+  const measureHeight = () => H + 76;
+  const widget = node.addDOMWidget("bruxos_compare_ui", "compare", wrap, {
+    serialize: false,
+    hideOnZoom: false,
+    getMinHeight: measureHeight,
+    getMaxHeight: measureHeight,
+    margin: 0,
+  });
+  widget.serialize = false;
+  widget.serializeValue = () => undefined;
+  widget.computeSize = (width) => [width, measureHeight()];
+  widget.computeLayoutSize = () => ({
+    minWidth: 1,
+    minHeight: measureHeight(),
+    maxHeight: measureHeight(),
+  });
+  widget.getHeight = measureHeight;
 
   node._cmp = { wrap, bar, modes, stage, va, vb, divider, play, swap, mode: "slider", split: 0.5 };
 
@@ -158,8 +153,15 @@ function loadVideos(node, data) {
   if (data.b) { c.vb.src = viewURL(data.b); c.vb.load(); }
   c.va.play().catch(()=>{}); c.vb.play().catch(()=>{});
   c.play.textContent = "⏸ Pause";
-  node.setSize(node.computeSize());
-  node.setDirtyCanvas(true, true);
+  requestAnimationFrame(() => {
+    const computed = node.computeSize?.();
+    if (!computed) return;
+    node.setSize?.([
+      Math.max(Number(node.size?.[0]) || 0, Number(computed[0]) || 0),
+      Math.max(120, Number(computed[1]) || 0),
+    ]);
+    node.setDirtyCanvas?.(true, true);
+  });
 }
 
 app.registerExtension({
