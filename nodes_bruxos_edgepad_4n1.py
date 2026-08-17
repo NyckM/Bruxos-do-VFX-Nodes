@@ -2192,316 +2192,178 @@ class BruxosTrim4n1:
             )
             return (images,)
         return (images[:original_count],)
-    
-class BruxosPad4n1EdgeGuard:
+
+
+
+# -------------------------------------------------------------------------
+# 4n+1 com guardas de borda (4 frames no inicio + 4 no fim)
+# -------------------------------------------------------------------------
+# Uso:
+#   video -> BruxosPad4n1EdgeGuard -> [processamento Wan / ping-pong / reverse]
+#         -> BruxosTrim4n1EdgeGuard -> volta EXATAMENTE ao numero de frames original
+#
+# Exemplo: 80f -> +4 inicio +4 fim = 88f -> alinha para 89f (4n+1).
+# O alinhamento extra (0..3f) e preenchido refletindo a cauda ORIGINAL em reverse,
+# sem alterar os 4 frames congelados de guarda no inicio/fim.
+
+
+def _bx_reverse_tail_pad(frames: "torch.Tensor", count: int) -> "torch.Tensor":
+    """Retorna `count` frames extras em reflexao reversa da cauda original.
+
+    Para [..., A, B, C, D] produz C, B, A, ... (nao repete D logo de cara).
+    Como o ajuste ate 4n+1 precisa no maximo 3 frames, normalmente usamos
+    apenas os 3 frames anteriores ao ultimo. Para videos curtissimos, faz
+    ping-pong dos indices validos; 1 frame = repete o unico frame.
     """
-    Adiciona 4 frames em ping-pong/reflexo antes e depois do video
-    e continua o padding ate atingir 4n+1.
+    count = max(0, int(count))
+    n = int(frames.shape[0])
+    if count <= 0:
+        return frames[:0]
+    if n <= 1:
+        return frames[:1].repeat(count, *([1] * (frames.dim() - 1)))
 
-    Exemplo para 80 frames:
-        entrada: 80
-        +4 inicio
-        +4 final
-        = 88
-        completa para 89 (4n+1)
+    idx = []
+    i = n - 2
+    direction = -1
+    while len(idx) < count:
+        idx.append(i)
+        i += direction
+        if i < 0:
+            i = 1
+            direction = 1
+        elif i > n - 1:
+            i = n - 2
+            direction = -1
+    return frames[idx]
 
-    O video original comeca sempre no indice 4.
+
+class BruxosPad4n1EdgeGuard:
+    """Adiciona 4 copias do primeiro frame + 4 do ultimo e alinha para 4n+1.
+
+    As guardas protegem as pontas durante processos temporais. Qualquer resto
+    necessario para chegar em 4n+1 (0..3 frames) usa reflexao/ping-pong reversa
+    da cauda original. Use o Trim correspondente depois do processamento.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": (
-                    "IMAGE",
-                    {
-                        "tooltip":
-                            "Video de entrada. Adiciona guards temporais "
-                            "em ping-pong e completa para 4n+1."
-                    },
-                ),
+                "images": ("IMAGE", {"tooltip":
+                    "Video de entrada. O node adiciona 4 frames do primeiro frame, "
+                    "4 do ultimo e completa ate 4n+1."}),
             },
             "optional": {
-                "guard_frames": (
-                    "INT",
-                    {
-                        "default": 4,
-                        "min": 0,
-                        "max": 64,
-                        "step": 1,
-                        "tooltip":
-                            "Quantidade de frames refletidos adicionados "
-                            "antes e depois do video."
-                    },
-                ),
-                "enabled": (
-                    "BOOLEAN",
-                    {
-                        "default": True,
-                        "tooltip":
-                            "Desligue para passar o video sem padding."
-                    },
-                ),
+                "enabled": ("BOOLEAN", {"default": True,
+                    "tooltip": "Desligue para bypass/debug. Quando off, nao adiciona guardas nem alinhamento."}),
             },
         }
 
     RETURN_TYPES = ("IMAGE", "INT", "INT", "INT")
-    RETURN_NAMES = (
-        "images",
-        "original_count",
-        "padded_count",
-        "trim_start",
+    RETURN_NAMES = ("images", "original_count", "padded_count", "trim_start")
+    OUTPUT_TOOLTIPS = (
+        "Video com guardas + alinhamento 4n+1.",
+        "Quantidade original de frames. Ligue no Trim correspondente.",
+        "Quantidade enviada ao processamento.",
+        "Indice onde comeca o video original dentro do padded. Ligue no Trim correspondente.",
     )
-
     FUNCTION = "run"
     CATEGORY = "Bruxos do VFX/Video"
+    DESCRIPTION = (
+        "Prepara video para processamento temporal/Wan: adiciona 4 copias do primeiro frame "
+        "antes do video e 4 copias do ultimo depois, entao completa para o proximo 4n+1. "
+        "O resto de 0..3 frames usa reflexao reversa da cauda. Ex.: 80 -> 89 frames."
+    )
 
-    def run(self, images, guard_frames=4, enabled=True):
-        import torch
+    def run(self, images, enabled=True):
+        n = int(images.shape[0])
+        if n <= 0:
+            raise ValueError("BruxosPad4n1EdgeGuard recebeu um IMAGE sem frames.")
 
-        original_count = int(images.shape[0])
+        if not enabled:
+            return (images, n, n, 0)
 
-        if not enabled or original_count <= 0:
-            return (
-                images,
-                original_count,
-                original_count,
-                0,
+        edge = 4
+        rep_shape = [1] * (images.dim() - 1)
+        first_guard = images[:1].repeat(edge, *rep_shape)
+        last_guard = images[-1:].repeat(edge, *rep_shape)
+
+        base_count = n + edge + edge
+        target = _bx_next_4n1(base_count)
+        align_extra = target - base_count  # sempre 0..3
+        reverse_tail = _bx_reverse_tail_pad(images, align_extra)
+
+        pieces = [first_guard, images, last_guard]
+        if align_extra > 0:
+            pieces.append(reverse_tail)
+        padded = torch.cat(pieces, dim=0)
+
+        # Guardrail: por construcao precisa ser exatamente 4n+1.
+        if (int(padded.shape[0]) - 1) % 4 != 0:
+            raise RuntimeError(
+                f"BruxosPad4n1EdgeGuard gerou {int(padded.shape[0])} frames, "
+                "mas o comprimento nao e 4n+1."
             )
 
-        guard_frames = max(0, int(guard_frames))
-
-        # -----------------------------------------------------
-        # Gera sequencia refletida ANTES do primeiro frame.
-        #
-        # F0 F1 F2 F3 F4...
-        #
-        # vira:
-        #
-        # F4 F3 F2 F1 | F0 F1 F2...
-        # -----------------------------------------------------
-
-        def make_left_guard(frames, count):
-            if count <= 0:
-                return frames[:0]
-
-            n = int(frames.shape[0])
-
-            if n == 1:
-                return frames.repeat(
-                    (count,) + (1,) * (frames.ndim - 1)
-                )
-
-            indices = []
-            pos = 1
-            direction = 1
-
-            while len(indices) < count:
-                indices.append(pos)
-
-                pos += direction
-
-                if pos >= n:
-                    pos = n - 2
-                    direction = -1
-
-                elif pos <= 0:
-                    pos = 1
-                    direction = 1
-
-            # Precisamos da ordem invertida antes de F0.
-            indices = list(reversed(indices))
-
-            idx = torch.tensor(
-                indices,
-                device=frames.device,
-                dtype=torch.long,
-            )
-
-            return frames.index_select(0, idx)
-
-        # -----------------------------------------------------
-        # Gera ping-pong depois do ultimo frame.
-        #
-        # ... F77 F78 F79
-        #
-        # vira:
-        #
-        # ... F77 F78 F79 | F78 F77 F76 F75...
-        # -----------------------------------------------------
-
-        def make_right_guard(frames, count):
-            if count <= 0:
-                return frames[:0]
-
-            n = int(frames.shape[0])
-
-            if n == 1:
-                return frames.repeat(
-                    (count,) + (1,) * (frames.ndim - 1)
-                )
-
-            indices = []
-            pos = n - 2
-            direction = -1
-
-            while len(indices) < count:
-                indices.append(pos)
-
-                pos += direction
-
-                if pos < 0:
-                    pos = 1
-                    direction = 1
-
-                elif pos >= n:
-                    pos = n - 2
-                    direction = -1
-
-            idx = torch.tensor(
-                indices,
-                device=frames.device,
-                dtype=torch.long,
-            )
-
-            return frames.index_select(0, idx)
-
-        left = make_left_guard(images, guard_frames)
-        right = make_right_guard(images, guard_frames)
-
-        padded = torch.cat(
-            [left, images, right],
-            dim=0,
+        _bx_logging.info(
+            f"[BruxosPad4n1EdgeGuard] {n} -> {int(padded.shape[0])} frames "
+            f"(+4 inicio, +4 fim, +{align_extra} reverse/ping-pong para 4n+1)"
         )
-
-        # -----------------------------------------------------
-        # Agora completa para o proximo comprimento 4n+1.
-        # -----------------------------------------------------
-
-        current = int(padded.shape[0])
-
-        remainder = (current - 1) % 4
-
-        if remainder == 0:
-            target = current
-        else:
-            target = current + (4 - remainder)
-
-        extra = target - current
-
-        if extra > 0:
-            # Continua o ping-pong a partir da borda direita
-            continuation = make_right_guard(
-                images,
-                guard_frames + extra,
-            )
-
-            continuation = continuation[
-                guard_frames:guard_frames + extra
-            ]
-
-            padded = torch.cat(
-                [padded, continuation],
-                dim=0,
-            )
-
-        padded_count = int(padded.shape[0])
-
-        print(
-            "[Bruxos EdgeGuard] "
-            f"{original_count} -> {padded_count} frames "
-            f"(guard={guard_frames}, 4n+1)"
-        )
-
-        return (
-            padded,
-            original_count,
-            padded_count,
-            guard_frames,
-        )
+        return (padded, n, int(padded.shape[0]), edge)
 
 
 class BruxosTrim4n1EdgeGuard:
-    """
-    Remove os guards/padding depois do processamento e devolve
-    exatamente a quantidade de frames da entrada original.
-    """
+    """Remove as guardas/padding e volta exatamente ao numero original de frames."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": (
-                    "IMAGE",
-                    {
-                        "tooltip":
-                            "Video depois do processamento."
-                    },
-                ),
-                "original_count": (
-                    "INT",
-                    {
-                        "default": 0,
-                        "min": 0,
-                        "max": 10000000,
-                        "tooltip":
-                            "Conecte ao original_count do EdgeGuard."
-                    },
-                ),
-                "trim_start": (
-                    "INT",
-                    {
-                        "default": 4,
-                        "min": 0,
-                        "max": 100000,
-                        "tooltip":
-                            "Conecte ao trim_start do EdgeGuard."
-                    },
-                ),
+                "images": ("IMAGE", {"tooltip":
+                    "Video ja processado a partir da saida do Pad 4n+1 + Edge Guards."}),
+                "original_count": ("INT", {"default": 1, "min": 1, "max": 10_000_000,
+                    "tooltip": "Ligue no original_count do Pad 4n+1 + Edge Guards."}),
+                "trim_start": ("INT", {"default": 4, "min": 0, "max": 1024,
+                    "tooltip": "Ligue no trim_start do Pad. Normalmente 4."}),
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("images",)
-
+    RETURN_TYPES = ("IMAGE", "INT")
+    RETURN_NAMES = ("images", "frame_count")
+    OUTPUT_TOOLTIPS = (
+        "Video restaurado para o intervalo original.",
+        "Quantidade final de frames (deve ser igual a original_count).",
+    )
     FUNCTION = "run"
     CATEGORY = "Bruxos do VFX/Video"
+    DESCRIPTION = (
+        "Par do Pad 4n+1 + Edge Guards. Remove tudo que foi acrescentado antes/depois "
+        "e devolve exatamente os frames correspondentes ao video original."
+    )
 
-    def run(self, images, original_count, trim_start):
-        available = int(images.shape[0])
+    def run(self, images, original_count, trim_start=4):
+        cur = int(images.shape[0])
+        n = max(0, int(original_count))
+        start = max(0, int(trim_start))
+        end = start + n
 
-        original_count = max(
-            0,
-            int(original_count),
+        if n <= 0:
+            return (images, cur)
+
+        if cur < end:
+            # Nao desloca o corte para "compensar": isso mudaria o alinhamento temporal.
+            # Melhor falhar explicitamente do que devolver frames errados.
+            raise ValueError(
+                f"BruxosTrim4n1EdgeGuard: video processado tem {cur} frames, "
+                f"mas preciso de pelo menos {end} para extrair {n} frames a partir de {start}."
+            )
+
+        trimmed = images[start:end]
+        _bx_logging.info(
+            f"[BruxosTrim4n1EdgeGuard] {cur} -> {int(trimmed.shape[0])} frames "
+            f"(slice {start}:{end})"
         )
-
-        trim_start = max(
-            0,
-            int(trim_start),
-        )
-
-        if original_count <= 0:
-            return (images,)
-
-        start = min(
-            trim_start,
-            available,
-        )
-
-        end = min(
-            start + original_count,
-            available,
-        )
-
-        result = images[start:end]
-
-        print(
-            "[Bruxos EdgeGuard Trim] "
-            f"{available} -> {result.shape[0]} frames "
-            f"(start={start}, original={original_count})"
-        )
-
-        return (result,)
+        return (trimmed, int(trimmed.shape[0]))
 
 # -------------------------------------------------------------------------
 # Qwen2.5-VL caption — substituto do Florence2Run
@@ -2940,11 +2802,15 @@ class BruxosBerniniPromptEnhancer:
 
 NODE_CLASS_MAPPINGS["BruxosPad4n1"] = BruxosPad4n1
 NODE_CLASS_MAPPINGS["BruxosTrim4n1"] = BruxosTrim4n1
+NODE_CLASS_MAPPINGS["BruxosPad4n1EdgeGuard"] = BruxosPad4n1EdgeGuard
+NODE_CLASS_MAPPINGS["BruxosTrim4n1EdgeGuard"] = BruxosTrim4n1EdgeGuard
 NODE_CLASS_MAPPINGS["BruxosQwenVLCaption"] = BruxosQwenVLCaption
 NODE_CLASS_MAPPINGS["BruxosBerniniPromptEnhancer"] = BruxosBerniniPromptEnhancer
 
 NODE_DISPLAY_NAME_MAPPINGS["BruxosPad4n1"] = "Pad to 4n+1 (Bruxos)"
 NODE_DISPLAY_NAME_MAPPINGS["BruxosTrim4n1"] = "Trim 4n+1 back to N (Bruxos)"
+NODE_DISPLAY_NAME_MAPPINGS["BruxosPad4n1EdgeGuard"] = "Pad 4n+1 + Edge Guards (Bruxos)"
+NODE_DISPLAY_NAME_MAPPINGS["BruxosTrim4n1EdgeGuard"] = "Trim Edge Guards back to N (Bruxos)"
 NODE_DISPLAY_NAME_MAPPINGS["BruxosQwenVLCaption"] = "Qwen-VL Caption (Bruxos)"
 NODE_DISPLAY_NAME_MAPPINGS["BruxosBerniniPromptEnhancer"] = "Bernini Prompt Enhancer (Bruxos)"
 
@@ -4507,10 +4373,7 @@ NODE_CLASS_MAPPINGS["BruxosDepthMask"] = BruxosDepthMask
 NODE_CLASS_MAPPINGS["BruxosColorMatch"] = BruxosColorMatch
 NODE_CLASS_MAPPINGS["BruxosFrameInterpolator"] = BruxosFrameInterpolator
 NODE_CLASS_MAPPINGS["LyonirExtract"] = LyonirExtract
-NODE_CLASS_MAPPINGS["BruxosPad4n1EdgeGuard"] = BruxosPad4n1EdgeGuard
-NODE_CLASS_MAPPINGS["BruxosTrim4n1EdgeGuard"] = BruxosTrim4n1EdgeGuard
-NODE_DISPLAY_NAME_MAPPINGS["BruxosPad4n1EdgeGuard"] = "Pad 4n+1 + Edge Guards (Bruxos)"
-NODE_DISPLAY_NAME_MAPPINGS["BruxosTrim4n1EdgeGuard"] = "Trim Edge Guards back to N (Bruxos)"
+
 NODE_DISPLAY_NAME_MAPPINGS["BruxosDepthMask"] = "Depth Mask DVD STANDALONE (Bruxos)"
 NODE_DISPLAY_NAME_MAPPINGS["BruxosColorMatch"] = "Color Match (Bruxos)"
 NODE_DISPLAY_NAME_MAPPINGS["BruxosFrameInterpolator"] = "Frame Interpolator (Bruxos)"
