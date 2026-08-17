@@ -35,6 +35,51 @@ function loaderName(node) {
   return node?.comfyClass || node?.constructor?.comfyClass || node?.type || "";
 }
 
+function patchAdvancedWidgetHeights(node) {
+  if (!Array.isArray(node?.widgets)) return;
+
+  for (const widget of node.widgets) {
+    if (!widget?.options?.advanced) continue;
+    if (widget._bruxosAdvancedHeightPatch) continue;
+
+    const originalComputeSize =
+      typeof widget.computeSize === "function"
+        ? widget.computeSize.bind(widget)
+        : null;
+
+    const originalGetHeight =
+      typeof widget.getHeight === "function"
+        ? widget.getHeight.bind(widget)
+        : null;
+
+    widget.computeSize = function(width) {
+      if (node.showAdvanced !== true) {
+        return [Number(width) || node.size?.[0] || 1, 0];
+      }
+
+      if (originalComputeSize) {
+        return originalComputeSize(width);
+      }
+
+      return [Number(width) || node.size?.[0] || 1, 24];
+    };
+
+    widget.getHeight = function() {
+      if (node.showAdvanced !== true) {
+        return 0;
+      }
+
+      if (originalGetHeight) {
+        return originalGetHeight();
+      }
+
+      return 24;
+    };
+
+    widget._bruxosAdvancedHeightPatch = true;
+  }
+}
+
 function fitHiddenLoader(node) {
   if ((node?._bruxosLoaderLayout || LOADERS.has(loaderName(node))) && node.showAdvanced !== true)
     fitVisibleHeight(node);
@@ -89,6 +134,7 @@ app.registerExtension({
       // Aguarda os previews adicionados por outras extensoes terminarem, para
       // o botao ficar realmente no rodape sem reordenar a lista depois.
       queueMicrotask(() => {
+        patchAdvancedWidgetHeights(this);
         addLegacyAdvancedButton(this);
         // Intercepta tambem o NodeFooter nativo do Nodes 2.0. A implementacao
         // original apenas alterna showAdvanced; agora a moldura acompanha.
@@ -118,7 +164,10 @@ app.registerExtension({
       }
       // Se advanced esta fechado, nao restaure a altura gigante de uma versao
       // anterior do node. Se esta aberto, preserve o tamanho salvo pelo usuario.
-      if (!this.showAdvanced) fitVisibleHeight(this);
+      patchAdvancedWidgetHeights(this);
+      if (!this.showAdvanced) {
+        fitVisibleHeight(this);
+      }
       return result;
     };
 

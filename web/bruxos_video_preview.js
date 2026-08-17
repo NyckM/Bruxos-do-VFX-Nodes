@@ -33,7 +33,17 @@ function placePreviewBeforeAdvanced(node, previewWidget, selectorName) {
   const selectorIndex = ordered.findIndex((item) => item.name === selectorName);
   ordered.splice(Math.max(0, selectorIndex + 1), 0, ...movers);
   node.widgets.splice(0, node.widgets.length, ...ordered);
-  node._widgetSlotsDirty = true;
+
+// Apaga as posições antigas para o Nodes 2.0 recalcular
+for (const widget of node.widgets) {
+    try {
+        delete widget.y;
+    } catch (_) {
+        widget.y = undefined;
+    }
+}
+
+node._widgetSlotsDirty = true;
   const finishLayout = () => {
     // onNodeCreated tambem roda durante configure(), antes de LGraph.add().
     // setDirtyCanvas exige node.graph e lanca NullGraphError sem esta guarda.
@@ -593,7 +603,37 @@ function probeAndFill(node, ref, folderType) {
     .then((r) => (r.ok ? r.json() : null))
     .then((info) => {
       if (!info || info.error) return;
+      function updateAutoHints(node) {
+        const info = node._bruxosProbeInfo;
+        if (!info || !Array.isArray(node.widgets)) return;
+      const hints = {
+        force_rate: info.fps,
+        custom_width: info.width,
+        custom_height: info.height,
+        frame_load_cap: info.frame_count,
+      };
+
+  for (const [name, value] of Object.entries(hints)) {
+    const widget = node.widgets.find((w) => w.name === name);
+    if (!widget || value == null) continue;
+
+    widget.options = widget.options || {};
+
+    // Guarda apenas uma indicação visual.
+    // NÃO altera widget.value: zero continua significando automático.
+    widget.options.placeholder = String(
+      Number.isFinite(Number(value))
+        ? Math.round(Number(value) * 1000) / 1000
+        : value
+    );
+
+    widget._bruxosAutoHint = value;
+  }
+
+  node.setDirtyCanvas?.(true, true);
+}
       node._bruxosProbeInfo = info;
+      updateAutoHints(node);
       renderInfo(node);
       node.setDirtyCanvas(true, true);
     })
