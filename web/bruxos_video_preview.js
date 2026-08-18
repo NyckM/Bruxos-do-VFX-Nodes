@@ -28,10 +28,25 @@ function placePreviewBeforeAdvanced(node, previewWidget, selectorName) {
     const text = `${item?.name || ""} ${item?.label || ""}`.toLowerCase();
     return item?.type === "button" && (text.includes("upload") || text.includes("escolher"));
   });
-  const movers = [...uploadWidgets, node._bruxosVideoGalleryButton, previewWidget].filter(Boolean);
+  // dedupe: o botao da galeria ja cai no filtro de uploadWidgets (nome tem
+  // "escolher") E era adicionado de novo explicitamente -- entrava 2x no
+  // array e deslocava os widgets reais 1 posicao a mais do que deveria.
+  const movers = [...new Set([...uploadWidgets, node._bruxosVideoGalleryButton, previewWidget])]
+    .filter(Boolean);
   const ordered = node.widgets.filter((item) => !movers.includes(item));
   const selectorIndex = ordered.findIndex((item) => item.name === selectorName);
-  ordered.splice(Math.max(0, selectorIndex + 1), 0, ...movers);
+  // Sem o widget-ancora (ex.: BruxosSaveVideo nao tem widget "video"), nao ha
+  // "antes de X" que faca sentido -- e Math.max(0, -1+1) empurraria os movers
+  // pro INICIO da lista (posicao 0), na frente de filename_prefix/fps/etc.
+  // Isso e exatamente o que causava os valores trocados (crf virando o texto
+  // do filename_prefix e por ai vai): a ordem de node.widgets no momento em
+  // que o configure()/clone() aplica os valores POR POSICAO deixa de bater
+  // com a ordem que existia quando esses valores foram salvos. Sem ancora,
+  // e mais seguro nao reordenar nada -- os movers ficam onde ja estavam
+  // (no fim, apos ensurePreview() adiciona-los), e widgets_values nunca
+  // desalinha.
+  if (selectorIndex === -1) return;
+  ordered.splice(selectorIndex + 1, 0, ...movers);
   node.widgets.splice(0, node.widgets.length, ...ordered);
 
 // Apaga as posições antigas para o Nodes 2.0 recalcular
@@ -430,7 +445,18 @@ function ensurePreview(node) {
     syncEnabled: true, draggingSeek: false,
   };
   node._bruxosPrev = preview;
-  placePreviewBeforeAdvanced(node, widget, "video");
+  // ADIADO (setTimeout 0): onNodeCreated roda ANTES do ComfyUI restaurar
+  // widgets_values (configure/copiar-colar/carregar workflow). Se o splice
+  // de placePreviewBeforeAdvanced reordena node.widgets AQUI, cada widget
+  // real (filename_prefix, fps, codec...) muda de indice ANTES do configure
+  // aplicar os valores salvos por posicao -> os valores caem no widget
+  // errado (ex.: pix_fmt virando "true", fps virando 0). Adiar pro proximo
+  // tick deixa o configure() rodar primeiro (ele atribui .value por
+  // REFERENCIA ao objeto do widget, que viaja junto quando reordenamos
+  // depois) -- so entao reordenamos, com seguranca.
+  setTimeout(() => {
+    try { placePreviewBeforeAdvanced(node, widget, "video"); } catch (e) {}
+  }, 0);
   registerTransport(preview);
 
   const openFullscreen = () => {
@@ -758,6 +784,25 @@ app.registerExtension({
       nodeType.prototype.onNodeCreated = function () {
         const r = onCreated ? onCreated.apply(this, arguments) : undefined;
         ensurePreview(this);
+        return r;
+      };
+      // Este node nao tinha onConfigure nenhum antes -- dependia so do
+      // setTimeout(0) dentro de ensurePreview pra reordenar os widgets depois
+      // dos valores restaurados (era exatamente ai que o bug do pix_fmt/codec
+      // acontecia). Adiciona um 2o disparo (via onConfigure, que so roda
+      // quando ha valores de fato sendo restaurados: colar, carregar workflow,
+      // trocar de aba) como garantia extra contra timing assincrono do Nodes 2.0.
+      const onConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function () {
+        const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+        const node = this;
+        const reorderWidgets = () => {
+          try {
+            if (node._bruxosPrev?.widget) placePreviewBeforeAdvanced(node, node._bruxosPrev.widget, "video");
+          } catch (e) {}
+        };
+        reorderWidgets();
+        setTimeout(reorderWidgets, 60);
         return r;
       };
       const onExec = nodeType.prototype.onExecuted;
