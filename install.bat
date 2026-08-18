@@ -1,144 +1,86 @@
 @echo off
-REM ============================================================================
-REM  ComfyUI Bruxos do VFX - instalador (Windows / Python embedded)
-REM
-REM  Rode de DENTRO da pasta do node:
-REM      ComfyUI\custom_nodes\ComfyUI-Bruxos-do-VFX\install.bat
-REM
-REM  O que ele faz:
-REM    1) instala as dependencias com o python_embeded CORRETO
-REM    2) instala o onnxruntime-gpu que CASA com a sua versao de CUDA (auto)
-REM    3) baixa os modelos do Bernini-R (INT8 ConvRot) + LoRAs LightX2V
-REM
-REM  REGRAS DE OURO (nao mude):
-REM    - NUNCA usa 'pip' solto (resolve pro Python errado).
-REM    - NUNCA instala/atualiza torch, numpy, triton, xformers ou flash-attn.
-REM      Isso quebraria seu ambiente. Este instalador NAO toca neles.
-REM ============================================================================
-setlocal enabledelayedexpansion
+setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
-echo.
-echo === Bruxos do VFX - instalador ===
-echo.
+title ComfyUI Bruxos do VFX - Instalador
 
-REM ---- localizar a raiz do ComfyUI subindo a partir daqui --------------------
 set "NODE_DIR=%~dp0"
-pushd "%NODE_DIR%\..\.."
-set "COMFY_DIR=%CD%"
-popd
-
-REM ---- achar o python embedded ----------------------------------------------
+set "COMFY_DIR="
 set "PY="
+set "SKIP_MODELS=0"
+if /I "%~1"=="--deps-only" set "SKIP_MODELS=1"
+if /I "%~1"=="--skip-models" set "SKIP_MODELS=1"
+
+echo.
+echo ============================================================
+echo   ComfyUI Bruxos do VFX - instalação / atualização
+echo ============================================================
+echo.
+
+for %%D in ("%NODE_DIR%..\..") do set "COMFY_DIR=%%~fD"
+if not exist "%COMFY_DIR%\custom_nodes" (
+  echo [ERRO] Esta pasta não está em ComfyUI\custom_nodes.
+  echo        ComfyUI detectado: "%COMFY_DIR%"
+  goto :fail
+)
+
 if exist "%COMFY_DIR%\..\python_embeded\python.exe" set "PY=%COMFY_DIR%\..\python_embeded\python.exe"
 if not defined PY if exist "%COMFY_DIR%\python_embeded\python.exe" set "PY=%COMFY_DIR%\python_embeded\python.exe"
+if not defined PY if exist "%COMFY_DIR%\.venv\Scripts\python.exe" set "PY=%COMFY_DIR%\.venv\Scripts\python.exe"
+if not defined PY if exist "%COMFY_DIR%\venv\Scripts\python.exe" set "PY=%COMFY_DIR%\venv\Scripts\python.exe"
+if not defined PY for /f "delims=" %%P in ('where python 2^>nul') do if not defined PY set "PY=%%P"
 if not defined PY (
-  echo [ERRO] Nao achei o python_embeded. Edite este .bat e aponte a variavel PY
-  echo        para o python.exe embedded do seu ComfyUI.
-  pause & exit /b 1
+  echo [ERRO] Python do ComfyUI não encontrado.
+  goto :fail
 )
-echo Python embedded: "%PY%"
-echo ComfyUI:         "%COMFY_DIR%"
+
+echo Node:    "%NODE_DIR%"
+echo ComfyUI: "%COMFY_DIR%"
+echo Python:  "%PY%"
 echo.
 
-REM ---- [1/4] dependencias base ----------------------------------------------
-echo [1/5] Dependencias base (opencv, onnx, requests, tqdm, huggingface_hub, psutil)...
-"%PY%" -m pip install --upgrade opencv-python onnx requests tqdm huggingface_hub psutil
-if errorlevel 1 (
-  echo [ERRO] Falha nas dependencias base. Veja o log acima.
-  pause & exit /b 1
-)
+echo [1/4] Instalando requirements.txt...
+"%PY%" -m pip install --upgrade -r "%NODE_DIR%requirements.txt"
+if errorlevel 1 goto :fail
+
 echo.
+echo [2/4] Dependências de Qwen-VL...
+"%PY%" -m pip install --upgrade "transformers>=4.45" accelerate pillow
+if errorlevel 1 echo [AVISO] Qwen-VL não foi instalado; caption/enhancer podem não carregar.
 
-REM ---- [2/4] onnxruntime-gpu que CASA com a CUDA do seu torch ----------------
-REM  IMPORTANTE: nao existe uma versao "certa" fixa. A build do onnxruntime tem
-REM  que bater com a CUDA do seu torch, senao o FaceFusion cai na CPU:
-REM    torch cu12x -> onnxruntime-gpu build CUDA 12
-REM    torch cu13x -> onnxruntime-gpu build CUDA 13 (o do PyPI padrao)
-REM  Detectamos automaticamente em vez de cravar uma versao.
-echo [2/5] Detectando a CUDA do seu torch...
-set "CUDA_MAJOR="
-for /f "delims=" %%i in ('"%PY%" -c "import torch,sys; v=torch.version.cuda or ''; sys.stdout.write(v.split('.')[0] if v else 'none')" 2^>nul') do set "CUDA_MAJOR=%%i"
-
-if "%CUDA_MAJOR%"=="12" (
-  echo       torch com CUDA 12 detectado -^> onnxruntime-gpu build CUDA 12
+echo.
+echo [3/4] ONNX Runtime compatível com a CUDA do torch...
+set "CUDA_MAJOR=none"
+for /f "delims=" %%C in ('"%PY%" -c "import torch; print((torch.version.cuda or 'none').split('.')[0])" 2^>nul') do set "CUDA_MAJOR=%%C"
+if "!CUDA_MAJOR!"=="12" (
   "%PY%" -m pip uninstall -y onnxruntime onnxruntime-gpu onnxruntime-openvino onnxruntime-directml >nul 2>&1
   "%PY%" -m pip install "onnxruntime-gpu<1.23" --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
-) else if "%CUDA_MAJOR%"=="13" (
-  echo       torch com CUDA 13 detectado -^> onnxruntime-gpu padrao do PyPI
+) else if "!CUDA_MAJOR!"=="13" (
   "%PY%" -m pip install --upgrade onnxruntime-gpu
 ) else (
-  echo       [AVISO] Nao consegui detectar a CUDA do torch ^(valor: "%CUDA_MAJOR%"^).
-  echo               Instalando o onnxruntime-gpu padrao. Se o face swap cair na CPU,
-  echo               instale a build que casa com a sua CUDA manualmente.
+  echo [AVISO] CUDA do torch não detectada ^(!CUDA_MAJOR!^); instalando build padrão.
   "%PY%" -m pip install --upgrade onnxruntime-gpu
 )
-if errorlevel 1 echo [AVISO] onnxruntime-gpu falhou. O face swap pode cair na CPU.
-echo.
+if errorlevel 1 echo [AVISO] ONNX Runtime GPU falhou; FaceFusion pode usar CPU.
 
-REM ---- [3/4] deps leves de tracking + Qwen (Prompt Enhancer / Caption) -------
-echo [3/5] Deps de tracking (roma, kornia, trimesh, einops, pyyaml)...
-"%PY%" -m pip install --upgrade roma kornia trimesh einops pyyaml
-if errorlevel 1 echo [AVISO] Alguma dep de tracking falhou; esses utilitarios podem nao carregar.
-
-echo       Deps do Qwen-VL (Prompt Enhancer / Caption)...
-"%PY%" -m pip install --upgrade transformers accelerate pillow
-if errorlevel 1 echo [AVISO] transformers/accelerate falharam; os nodes de Qwen podem nao carregar.
 echo.
-
-REM ---- [4/5] deps do DepthMask DVD (BruxosDepthMask) -------------------------
-echo [4/5] Deps do DepthMask DVD (omegaconf, peft, accelerate, safetensors, einops,
-echo       sentencepiece, matplotlib, modelscope, pandas, imageio[ffmpeg])...
-"%PY%" -m pip install --upgrade omegaconf peft accelerate safetensors einops sentencepiece matplotlib modelscope pandas "imageio[ffmpeg]"
-if errorlevel 1 echo [AVISO] Alguma dep do DepthMask DVD falhou; o node pode nao carregar.
-echo.
-echo       Verificando FlashAttention (flash_attn)...
-"%PY%" -c "import flash_attn" >nul 2>&1
-if errorlevel 1 (
-  echo       [AVISO] flash_attn NAO esta instalado. O DepthMask DVD roda bem mais
-  echo               lento ^(ou pode falhar^) sem ele. Este instalador NAO instala
-  echo               flash-attn sozinho ^(a wheel e especifica de CUDA/torch/python^).
-  echo               Rode o instalador dedicado: Add-ons\FlashAttention.bat
-  echo               ^(na pasta ComfyUI-Easy-Install, com o ComfyUI fechado^).
+if "%SKIP_MODELS%"=="1" (
+  echo [4/4] Download de modelos ignorado.
 ) else (
-  echo       flash_attn OK.
-)
-echo.
-
-REM ---- [5/5] modelos ---------------------------------------------------------
-echo [5/5] Baixando modelos (varios GB - pode demorar)...
-echo       Ja existentes sao PULADOS; pode rodar este .bat de novo pra retomar.
-echo.
-"%PY%" "%NODE_DIR%download_models.py" --models-dir "%COMFY_DIR%\models"
-if errorlevel 1 (
-  echo.
-  echo [AVISO] Algum modelo falhou. Rode o .bat de novo - ele retoma de onde parou.
+  echo [4/4] Baixando/validando modelos Bernini e Wan...
+  "%PY%" "%NODE_DIR%download_models.py" --models-dir "%COMFY_DIR%\models"
+  if errorlevel 1 echo [AVISO] Algum download falhou. Rode novamente para retomar.
 )
 
 echo.
-echo === Concluido. Reinicie o ComfyUI. ===
-echo.
-echo  Modelos instalados:
-echo    models\diffusion_models\  wan2.2_bernini_r_high/low_noise_int8_convrot.safetensors
-echo    models\loras\             Bernini-R_LightX2V_high/low_noise.safetensors  (4 steps)
-echo    models\text_encoders\     umt5_xxl_fp8_e4m3fn_scaled.safetensors
-echo    models\vae\               Wan2_1_VAE_bf16.safetensors
-echo.
-echo  ATENCAO no Loader Tudo-em-1:
-echo    - use o VAE de VIDEO (Wan2_1_VAE_bf16). Um VAE 'imageonly'/'upscale2x'
-echo      faz o video sair PRETO/quebrado.
-echo    - com as LoRAs LightX2V: cfg = 1.0 e steps = 6 (split_step 4).
-echo.
-echo  Os .onnx do face swap baixam sozinhos no 1o uso, em models\facefusion\.
-echo.
-echo  ----------------------------------------------------------------------------
-echo  REQUISITOS DE TERCEIROS (so p/ alguns nodes; o resto do pacote roda sem eles):
-echo    - Nodes MoCha (Embeds/Info/BBox) e WanVideo Context:
-echo        precisam do ComfyUI-WanVideoWrapper (Kijai) instalado.
-echo    - LTX Tiled Sampler:
-echo        precisa do ComfyUI-LTXVideo (Lightricks) instalado.
-echo    Estes instaladores NAO instalam esses pacotes (nao mexemos em nodes de
-echo    terceiros); instale-os pelo ComfyUI-Manager se for usar esses nodes.
-echo  ----------------------------------------------------------------------------
+echo [OK] Instalação concluída. Reinicie o ComfyUI e pressione F5.
 echo.
 pause
-endlocal
+exit /b 0
+
+:fail
+echo.
+echo [ERRO] Instalação interrompida. Consulte as mensagens acima.
+echo Torch, numpy, triton, xformers e flash-attn não foram alterados diretamente.
+echo.
+pause
+exit /b 1

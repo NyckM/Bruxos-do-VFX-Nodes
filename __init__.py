@@ -60,6 +60,8 @@ _merge("bruxos_h3_cond_forca")  # H3: forca do condicionamento (minimax_*_cond_n
 _merge("bruxos_h3_prompt_rapido")  # H3 Prompt Rapido: macros @ e # -> tags do H3, sem LLM (ideia do ComfyUI-MiniMaxH3-Easy, MIT)
 _merge("bruxos_h3_frames")  # H3 Frames: grade valida (length %17==5, o "4n+1" do H3) + casa a referencia no tamanho
 _merge("bruxos_h3_latent_upscale")  # H3 2-pass: escala o latente entre samplers + reescala as refs do condicionamento
+_merge("bruxos_bernini_latent_upscale")  # Bernini 2-pass: escala o latente do Wan (16ch, sem audio) entre dois BerniniInfinity
+_merge("bruxos_bernini_conditioning")  # Bernini Conditioning standalone: monta context_latents (identidade/refs) sem rodar sampler -- p/ 2o passe leve fora do BerniniInfinity
 _merge("bruxos_h3_loader")  # H3 Loader: transformer + text encoder + os DOIS VAEs num node so
 _merge("bruxos_idv2v_condition")  # ID-V2V: sinal de controle foreground-on-gray (SAM3) pro control_video do VACE
 _merge("bruxos_mask_bbox")  # Mascara -> BBox -> recorta / gera / cola de volta (o H3 NAO tem entrada de mascara)

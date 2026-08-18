@@ -254,6 +254,50 @@ def _encode_video(vae, video):
     return encoded
 
 
+def _resize_latent_spatial(samples, new_h, new_w, mode="bicubic"):
+    """[B,C,T,H,W] -> mesma coisa com H,W novos (so espacial; T intocado)."""
+    B, C, T, H, W = (int(v) for v in samples.shape)
+    new_h, new_w = int(new_h), int(new_w)
+    if (H, W) == (new_h, new_w):
+        return samples
+    x = samples.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+    kwargs = {"align_corners": False} if mode in ("bilinear", "bicubic") else {}
+    x = torch.nn.functional.interpolate(x.float(), size=(new_h, new_w), mode=mode, **kwargs)
+    return x.reshape(B, T, C, new_h, new_w).permute(0, 2, 1, 3, 4).to(samples.dtype).contiguous()
+
+
+def _prepare_init_latent(init_latent, target_t, target_h, target_w, mode="bicubic"):
+    """Adapta um LATENT externo (saida de um passe anterior, tipicamente ja
+    upscalado) pro grid exato deste passe: [1,16,target_t,target_h,target_w].
+    Redimensiona espaco por interpolacao; tempo por corte/repeticao do ultimo
+    latente (o uso esperado e MESMO source_video nos dois passes, entao T
+    normalmente ja bate)."""
+    samples = init_latent.get("samples") if isinstance(init_latent, dict) else init_latent
+    if not torch.is_tensor(samples):
+        raise ValueError("[Bernini Infinity] init_latent invalido: nao encontrei 'samples' (tensor).")
+    if samples.ndim != 5:
+        raise ValueError(f"[Bernini Infinity] init_latent esperava [B,C,T,H,W]; veio {tuple(samples.shape)}.")
+    B, C, T, H, W = (int(v) for v in samples.shape)
+    if C != 16:
+        raise ValueError(
+            f"[Bernini Infinity] init_latent tem {C} canais; o latente do Wan/Bernini tem 16. "
+            "Confirme que ele veio de um passe do BerniniInfinity (ou de um upscaler compativel), "
+            "nao de outro modelo (ex.: MiniMax H3 tem 24 canais)."
+        )
+    out = _resize_latent_spatial(samples, target_h, target_w, mode)
+    if T != target_t:
+        print(f"[Bernini Infinity] init_latent: T={T} != alvo T={target_t}; ajustando "
+              f"(corte/repeticao do ultimo latente). Espera-se que os dois passes usem o "
+              f"MESMO source_video -- se T bate normalmente, confira max_frames/chunk_size.", flush=True)
+        if T > target_t:
+            out = out[:, :, :target_t]
+        else:
+            pad = out[:, :, -1:].repeat(1, 1, target_t - T, 1, 1)
+            out = torch.cat([out, pad], dim=2)
+    device = comfy.model_management.intermediate_device()
+    return out.to(device=device)
+
+
 # ----------------------------------------------------------------------
 # ALINHAMENTO TEMPORAL (4n+1) -- por que o video "perde" frames:
 #   o Wan VAE comprime o tempo em ~4x. N frames viram T_lat = ((N-1)//4)+1
@@ -810,15 +854,30 @@ def _context_windows(total, win, overlap, offset=0):
     return [(p, p + win) for p in sorted(starts)]
 
 
-def _window_blend_weights(length, ramp, device, dtype):
-    """Pesos de blend (rampa Hann nas bordas) ao longo do eixo temporal latente."""
+def _window_blend_weights(length, ramp_left, ramp_right, device, dtype):
+    """Pesos de blend (rampa Hann) nas bordas esquerda/direita da janela.
+
+    ramp_left/ramp_right sao a sobreposicao REAL com a janela vizinha anterior/
+    seguinte (nao um valor fixo de overlap configurado): como as pontas 0 e
+    total-win ficam sempre ancoradas (ver _context_windows), a sobreposicao com
+    a janela vizinha pode ficar maior OU menor que `overlap` perto das bordas do
+    video e conforme o jitter desliza as fronteiras internas. Usar sempre o
+    `overlap` configurado como rampa (comportamento antigo) descasava do
+    tamanho real da sobreposicao: sobra uma faixa "achatada" (peso 1.0 dos dois
+    lados, sem rampa) sempre que a sobreposicao real > overlap configurado --
+    essa faixa acaba sendo uma media 50/50 sem suavizacao entre duas predicoes
+    independentes, o que aparece como emenda/instabilidade nas transicoes.
+    """
     w = torch.ones(length, device=device, dtype=dtype)
-    ramp = int(min(max(0, ramp), length // 2))
-    if ramp > 0:
-        t = torch.linspace(0.0, math.pi, steps=ramp + 2, device=device, dtype=dtype)[1:-1]
+    ramp_left = int(min(max(0, ramp_left), length // 2))
+    ramp_right = int(min(max(0, ramp_right), length // 2))
+    if ramp_left > 0:
+        t = torch.linspace(0.0, math.pi, steps=ramp_left + 2, device=device, dtype=dtype)[1:-1]
+        w[:ramp_left] = (1.0 - torch.cos(t)) * 0.5
+    if ramp_right > 0:
+        t = torch.linspace(0.0, math.pi, steps=ramp_right + 2, device=device, dtype=dtype)[1:-1]
         edge = (1.0 - torch.cos(t)) * 0.5
-        w[:ramp] = edge
-        w[-ramp:] = torch.flip(edge, dims=[0])
+        w[-ramp_right:] = torch.flip(edge, dims=[0])
     return w
 
 
@@ -855,11 +914,39 @@ def _debug_dump_shapes(obj, total, prefix="c", depth=0, acc=None):
     return acc
 
 
-def _make_context_wrapper(win_len, win_overlap, ramp, jitter=True, debug_holder=None):
+def _make_context_wrapper(win_len, win_overlap, ramp=None, jitter=True, debug_holder=None):
     """model_function_wrapper estilo WanVideoWrapper: divide o latente completo em
     janelas sobrepostas a cada passo, roda o modelo em cada uma e compoe as predicoes
-    com blend. Com jitter, as fronteiras internas deslizam por passo."""
-    state = {"calls": 0}
+    com blend. Com jitter, as fronteiras internas deslizam por passo.
+
+    Duas correcoes em relacao a versao anterior (ambas sobre a MESMA causa: as
+    janelas nao ficavam consistentes entre si, entao a transicao entre elas
+    "nao seguia o frame certo"):
+
+    1) O offset do jitter avancava por CHAMADA do wrapper, nao por PASSO de
+       sampling. Um unico passo de denoise pode chamar o model_function mais
+       de uma vez (positivo/negativo com cfg>1, os varios forwards de
+       guidance_mode=stream, samplers tipo Heun/DPM++ que corrigem em 2
+       sub-chamadas). Isso fazia, por exemplo, positivo e negativo do MESMO
+       passo caírem em janelas DIFERENTES -- o delta do CFG (pos-neg) virava
+       a diferenca entre duas predicoes recortadas em pontos diferentes do
+       video, o que e sem sentido e gera instabilidade/tremedeira exatamente
+       nas bordas das janelas. Agora o offset so avanca quando o timestep
+       muda: todas as chamadas do mesmo passo usam a MESMA janela.
+
+    2) A rampa de blend usava sempre o `overlap` configurado, mas a
+       sobreposicao REAL entre duas janelas vizinhas varia (as pontas 0 e
+       total-win ficam sempre ancoradas -- ver _context_windows -- entao a
+       sobreposicao com a janela vizinha pode ficar bem maior ou menor que o
+       overlap configurado, sobretudo perto das pontas do video e conforme o
+       jitter desliza). Rampa fixa != sobreposicao real deixava uma faixa sem
+       suavizacao (peso 1.0 dos dois lados) sendo apenas MEDIADA 50/50 entre
+       duas predicoes independentes -- variavel a cada passo -- em vez de uma
+       transicao suave. Agora a rampa de cada lado usa a sobreposicao REAL
+       com a janela anterior/seguinte.
+    """
+    del ramp  # obsoleto -- so por compatibilidade de assinatura, ver acima
+    state = {"step": -1, "last_t": None}
     stride = max(1, win_len - win_overlap)
 
     def wrapper(model_function, params):
@@ -868,8 +955,19 @@ def _make_context_wrapper(win_len, win_overlap, ramp, jitter=True, debug_holder=
         c = params["c"]
         total = int(x.shape[2])
 
-        offset = _ordered_offset(state["calls"], stride) if jitter else 0
-        state["calls"] += 1
+        # chave do passo = valor do timestep (sigma). So avanca o jitter
+        # quando o timestep muda, entao todas as chamadas do mesmo passo de
+        # sampling (pos/neg, streams, sub-chamadas do sampler) usam a mesma
+        # janela -- ver ponto (1) da docstring acima.
+        try:
+            t_key = round(float(t.flatten()[0].item()), 6) if torch.is_tensor(t) else float(t)
+        except Exception:
+            t_key = None
+        if t_key is None or t_key != state["last_t"]:
+            state["last_t"] = t_key
+            state["step"] += 1
+
+        offset = _ordered_offset(max(0, state["step"]), stride) if jitter else 0
         windows = _context_windows(total, win_len, win_overlap, offset)
 
         if debug_holder is not None and not debug_holder.get("printed"):
@@ -886,11 +984,15 @@ def _make_context_wrapper(win_len, win_overlap, ramp, jitter=True, debug_holder=
 
         out = torch.zeros_like(x)
         counter = torch.zeros((1, 1, total, 1, 1), device=x.device, dtype=x.dtype)
-        for (s, e) in windows:
+        n = len(windows)
+        for i, (s, e) in enumerate(windows):
             xw = x[:, :, s:e]
             cw = _slice_temporal(c, s, e, total)
             ow = model_function(xw, t, **cw)
-            wts = _window_blend_weights(e - s, ramp, x.device, x.dtype).view(1, 1, e - s, 1, 1)
+            # sobreposicao REAL com a vizinha anterior/seguinte (ver ponto 2)
+            ramp_left = max(0, windows[i - 1][1] - s) if i > 0 else 0
+            ramp_right = max(0, e - windows[i + 1][0]) if i < n - 1 else 0
+            wts = _window_blend_weights(e - s, ramp_left, ramp_right, x.device, x.dtype).view(1, 1, e - s, 1, 1)
             out[:, :, s:e] += ow * wts
             counter[:, :, s:e] += wts
         return out / counter.clamp(min=1e-6)
@@ -937,6 +1039,14 @@ class BerniniInfinity:
                 "resize_mode": (["stretch", "crop"], {"default": "stretch", "tooltip": "Encaixe quando a proporcao do video difere de width/height. stretch = estica pro tamanho exato, SEM cortar (pode distorcer um pouco). crop = corta as bordas mantendo a proporcao."}),
             },
             "optional": {
+                "init_latent": ("LATENT", {"tooltip":
+                    "2-PASSE (hires-fix): latente inicial pra CONTINUAR a geracao em vez de comecar do zero. "
+                    "Fluxo: rode este node numa resolucao BAIXA (denoise=1.0) -> pegue a saida 'latent' -> "
+                    "upscale ela (ex.: 'Bernini Latent Upscale (Bruxos)') -> ligue aqui num SEGUNDO "
+                    "BerniniInfinity, com width/height ALVO e denoise < 1.0 (0.4-0.6 costuma refinar bem). "
+                    "O latente e redimensionado automaticamente (bicubic) pra bater com width/height/frames "
+                    "deste passe -- nao precisa bater exato. So funciona com mode=context_window por enquanto. "
+                    "Deixe vazio pra gerar do zero (comportamento padrao, denoise=1.0 obrigatorio nesse caso)."}),
                 "limpar_vram": (["off", "leve", "agressivo"], {"default": "leve", "tooltip": "Limpeza de VRAM entre os passos high/low e entre os blocos de frames, pra rodar resolucoes maiores e videos longos sem entupir a GPU. off = nada (legado). leve = gc + esvazia cache da VRAM (barato, recomendado). agressivo = tambem DESCARREGA os modelos entre os passos (high e low nunca ficam juntos na VRAM = menor pico), porem recarrega o modelo a cada troca (mais lento). Use agressivo so se estourar VRAM em resolucao alta."}),
                 "force_unload_between_passes": ("BOOLEAN", {"default": False, "tooltip": "[anti-OOM] Descarrega o modelo HIGH da VRAM ANTES de comecar o LOW, IGNORANDO o guard de LoRA. Ligue se der OOM exatamente quando o passo LOW comeca -- e o sinal de que os dois modelos (high+low) nao cabem juntos na placa (ex.: INT8 14B ~14GB cada numa placa de 22GB). Custa um re-stage por passo (mais lento), mas evita o pico. Deixe DESLIGADO se voce NAO esta com OOM."}),
                 "monitor_memoria": ("BOOLEAN", {"default": False, "tooltip": "Imprime no console o uso de RAM e VRAM em tempo real (inicio, entre high/low, por bloco e no fim). Use pra diagnosticar onde a memoria enche. Precisa de CUDA (VRAM) e psutil (RAM); o que faltar aparece em branco."}),
@@ -1086,6 +1196,7 @@ class BerniniInfinity:
         persistent_first_frame=False,
         first_frame_strength=0.45,
         first_frame_decay=0.75,
+        init_latent=None,
         **kwargs,
     ):
         # guidance: 'off' = CFG unico (padrao). 'tiled' = ladrilho. Os demais sao
@@ -1200,6 +1311,13 @@ class BerniniInfinity:
             if key.startswith("reference_images.reference_image_") and value is not None
         }
 
+        if init_latent is not None and mode != "context_window":
+            raise ValueError(
+                "[Bernini Infinity] init_latent (2-passe) so e suportado com mode=context_window. "
+                "No modo sequential cada bloco tem seu proprio recorte temporal e nao ha um jeito "
+                "seguro de fatiar um unico latente inicial entre eles ainda."
+            )
+
         if mode == "context_window":
             return self._render_context_window(
                 positive, negative, high_model, low_model, vae, source_video,
@@ -1214,6 +1332,7 @@ class BerniniInfinity:
                 force_unload_between_passes=force_unload_between_passes,
                 persistent_first_frame=persistent_first_frame,
                 first_frame_strength=first_frame_strength,
+                init_latent=init_latent,
             )
         return self._render_sequential(
             positive, negative, high_model, low_model, vae, source_video,
@@ -1527,6 +1646,7 @@ class BerniniInfinity:
         limpar_vram="leve", monitor_memoria=False,
         force_unload_between_passes=False,
         persistent_first_frame=False, first_frame_strength=0.45,
+        init_latent=None,
     ):
         target = int(target)
         # --- alinhamento temporal: trabalhamos no proximo 4n+1 e cortamos depois ---
@@ -1597,7 +1717,15 @@ class BerniniInfinity:
         neg = _clone_conditioning_set_values(negative, values)
 
         # ============ MODO INPAINT: gera normal e mantem so a area da mascara ======
-        latent = {"samples": _make_empty_latent(int(aligned), int(width), int(height), 1)}
+        if init_latent is not None:
+            lat_h, lat_w = int(height) // 8, int(width) // 8
+            start_samples = _prepare_init_latent(init_latent, T_lat, lat_h, lat_w)
+            latent = {"samples": start_samples}
+            print(f"[Bernini Infinity][ctx] init_latent 2-passe ligado: continuando de um latente "
+                  f"existente redimensionado pra {tuple(start_samples.shape)}. Confira que 'denoise' "
+                  f"esta < 1.0 neste passe (senao voce esta gerando do zero mesmo assim).", flush=True)
+        else:
+            latent = {"samples": _make_empty_latent(int(aligned), int(width), int(height), 1)}
         if use_mask:
             print("[Bernini Infinity][ctx] mascara inpaint ativa "
                   "(composite em pixels: fora da mascara = fonte).", flush=True)
